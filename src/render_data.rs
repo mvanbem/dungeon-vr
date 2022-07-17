@@ -4,7 +4,6 @@ use std::mem::size_of;
 use ash::vk;
 use cgmath::Matrix4;
 
-use crate::mesh::{load_assets, Mesh};
 use crate::vk_handles::VkHandles;
 use crate::{
     flat_color, textured, PushConstants, COLOR_FORMAT, DEPTH_FORMAT, RENDER_CONCURRENCY, VIEW_COUNT,
@@ -28,7 +27,6 @@ pub struct RenderData<'a> {
 
     pub flat_color_pipeline: vk::Pipeline,
     pub textured_pipeline: vk::Pipeline,
-    pub meshes: Vec<Mesh>,
 }
 
 impl<'a> RenderData<'a> {
@@ -47,8 +45,6 @@ impl<'a> RenderData<'a> {
             unsafe { flat_color::create_pipeline(vk, pipeline_layout, render_pass) };
         let textured_pipeline =
             unsafe { textured::create_pipeline(vk, pipeline_layout, render_pass) };
-        let mut meshes = vec![crate::mesh::create_debug_mesh(vk)];
-        meshes.extend(load_assets(vk).unwrap());
 
         Self {
             phantom_lifetime: PhantomData,
@@ -63,7 +59,6 @@ impl<'a> RenderData<'a> {
 
             flat_color_pipeline,
             textured_pipeline,
-            meshes,
         }
     }
 
@@ -81,9 +76,6 @@ impl<'a> RenderData<'a> {
     }
 
     pub unsafe fn destroy(self, device: &ash::Device) {
-        for mesh in self.meshes {
-            mesh.destroy(device);
-        }
         device.destroy_pipeline(self.textured_pipeline, None);
         device.destroy_pipeline(self.flat_color_pipeline, None);
         for frame_resources in self.frame_resources {

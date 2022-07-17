@@ -4,16 +4,22 @@ use std::time::Duration;
 
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use cgmath::{frustum, vec3, Matrix4, Quaternion, SquareMatrix, Transform};
+use cgmath::{frustum, vec3, Matrix4, Quaternion, Transform};
+use enum_map::{Enum, EnumMap};
 use openxr as xr;
+use slotmap::SecondaryMap;
 
+use crate::asset::{MeshAssetKey, MeshAssets};
+use crate::game::{Game, VrHand, VrTracking};
 use crate::render_data::RenderData;
 use crate::swapchain::Swapchain;
 use crate::vk_handles::VkHandles;
 use crate::xr_handles::XrHandles;
 use crate::xr_session::XrSession;
 
+mod asset;
 mod flat_color;
+mod game;
 mod mesh;
 mod render_data;
 mod swapchain;
@@ -37,14 +43,25 @@ pub fn main() {
     let vk = VkHandles::new(&xr);
     let mut xrs = XrSession::new(&xr, &vk);
     let render = RenderData::new(&vk);
+    let mut mesh_assets = MeshAssets::new(&vk);
+    let mut game = Game::new(&mut mesh_assets);
 
     let mut swapchain = None;
-
-    main_loop(running, &vk, &xr, &mut xrs, &render, &mut swapchain);
+    main_loop(
+        running,
+        &vk,
+        &xr,
+        &mut xrs,
+        &render,
+        &mut swapchain,
+        &mut mesh_assets,
+        &mut game,
+    );
 
     drop(xrs);
     render.wait_for_fences(&vk);
     unsafe {
+        mesh_assets.destroy();
         render.destroy(vk.device());
         if let Some(swapchain) = swapchain {
             swapchain.destroy(vk.device());
@@ -110,6 +127,8 @@ fn main_loop<'a>(
     xrs: &mut XrSession,
     render: &RenderData,
     swapchain: &mut Option<Swapchain<'a>>,
+    mesh_assets: &mut MeshAssets,
+    game: &mut Game,
 ) {
     let mut event_storage = xr::EventDataBuffer::new();
     let mut session_running = false;
@@ -264,24 +283,63 @@ fn main_loop<'a>(
             ],
         );
 
-        // Read inputs and draw the hands.
+        // Read inputs.
         xrs.session
             .sync_actions(&[(&xrs.action_set).into()])
             .unwrap();
-        let left_location = xrs
-            .left_space
-            .locate(&xrs.stage, xr_frame_state.predicted_display_time)
-            .unwrap();
-        let right_location = xrs
-            .right_space
-            .locate(&xrs.stage, xr_frame_state.predicted_display_time)
-            .unwrap();
+        let vr_tracking = VrTracking {
+            head: xr::Posef::IDENTITY,
+            hands: [
+                VrHand {
+                    pose: if xrs
+                        .left_action
+                        .is_active(&xrs.session, xr::Path::NULL)
+                        .unwrap()
+                    {
+                        xrs.left_space
+                            .locate(&xrs.stage, xr_frame_state.predicted_display_time)
+                            .unwrap()
+                            .pose
+                    } else {
+                        xr::Posef::IDENTITY
+                    },
+                },
+                VrHand {
+                    pose: if xrs
+                        .right_action
+                        .is_active(&xrs.session, xr::Path::NULL)
+                        .unwrap()
+                    {
+                        xrs.right_space
+                            .locate(&xrs.stage, xr_frame_state.predicted_display_time)
+                            .unwrap()
+                            .pose
+                    } else {
+                        xr::Posef::IDENTITY
+                    },
+                },
+            ],
+        };
+
+        // Step the game and extract rendering data.
+        let meshes = game.update(vr_tracking);
+
+        // Group mesh instances.
+        let mut sorted_meshes: EnumMap<
+            VertexFormat,
+            SecondaryMap<MeshAssetKey, Vec<Matrix4<f32>>>,
+        > = Default::default();
+        for (mesh_key, transforms) in meshes {
+            let mesh = mesh_assets.get(mesh_key);
+            sorted_meshes[mesh.vertex_format]
+                .entry(mesh_key)
+                .unwrap()
+                .or_default()
+                .extend(transforms);
+        }
+
+        // Draw all meshes.
         unsafe {
-            vk.device().cmd_bind_pipeline(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                render.flat_color_pipeline,
-            );
             vk.device().cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -291,83 +349,47 @@ fn main_loop<'a>(
                 &[],
             );
         }
-        for (action, location) in [
-            (&xrs.left_action, left_location),
-            (&xrs.right_action, right_location),
-        ] {
-            let model = if action.is_active(&xrs.session, xr::Path::NULL).unwrap() {
-                cgmath::Decomposed {
-                    scale: 1.0,
-                    rot: Quaternion::new(
-                        location.pose.orientation.w,
-                        location.pose.orientation.x,
-                        location.pose.orientation.y,
-                        location.pose.orientation.z,
-                    ),
-                    disp: vec3(
-                        location.pose.position.x,
-                        location.pose.position.y,
-                        location.pose.position.z,
-                    ),
-                }
-                .into()
-            } else {
-                Matrix4::identity()
-            };
-
-            let mesh = &render.meshes[0];
-            unsafe {
-                vk.device()
-                    .cmd_bind_vertex_buffers(cmd, 0, &[mesh.vertex_buffer], &[0]);
-                vk.device()
-                    .cmd_bind_index_buffer(cmd, mesh.index_buffer, 0, mesh.index_type);
-                vk.device().cmd_push_constants(
-                    cmd,
-                    render.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    bytemuck::bytes_of(&PushConstants {
-                        model: *model.as_ref(),
-                    }),
-                );
-                vk.device()
-                    .cmd_draw_indexed(cmd, mesh.count as u32, 1, 0, 0, 0);
+        for (vertex_format, meshes) in sorted_meshes {
+            match vertex_format {
+                VertexFormat::FlatColor => unsafe {
+                    vk.device().cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        render.flat_color_pipeline,
+                    );
+                },
+                VertexFormat::Textured => unsafe {
+                    vk.device().cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        render.textured_pipeline,
+                    );
+                },
             }
-        }
 
-        // Draw the world.
-        unsafe {
-            vk.device().cmd_bind_pipeline(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                render.textured_pipeline,
-            );
-            vk.device().cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                render.pipeline_layout,
-                0,
-                &[frame_resources.descriptor_set()],
-                &[],
-            );
-        }
-        for mesh in [&render.meshes[1]] {
-            unsafe {
-                vk.device()
-                    .cmd_bind_vertex_buffers(cmd, 0, &[mesh.vertex_buffer], &[0]);
-                vk.device()
-                    .cmd_bind_index_buffer(cmd, mesh.index_buffer, 0, mesh.index_type);
-                vk.device().cmd_push_constants(
-                    cmd,
-                    render.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    bytemuck::bytes_of(&PushConstants {
-                        model: *Matrix4::identity().as_ref(),
-                    }),
-                );
-                vk.device()
-                    .cmd_draw_indexed(cmd, mesh.count as u32, 1, 0, 0, 0);
+            for (mesh_key, transforms) in meshes {
+                let mesh = mesh_assets.get(mesh_key);
+                unsafe {
+                    vk.device()
+                        .cmd_bind_vertex_buffers(cmd, 0, &[mesh.vertex_buffer], &[0]);
+                    vk.device()
+                        .cmd_bind_index_buffer(cmd, mesh.index_buffer, 0, mesh.index_type);
+                }
+                for model in transforms {
+                    unsafe {
+                        vk.device().cmd_push_constants(
+                            cmd,
+                            render.pipeline_layout,
+                            vk::ShaderStageFlags::VERTEX,
+                            0,
+                            bytemuck::bytes_of(&PushConstants {
+                                model: *model.as_ref(),
+                            }),
+                        );
+                        vk.device()
+                            .cmd_draw_indexed(cmd, mesh.count as u32, 1, 0, 0, 0);
+                    }
+                }
             }
         }
 
@@ -473,3 +495,9 @@ const NOOP_STENCIL_STATE: vk::StencilOpState = vk::StencilOpState {
     write_mask: 0,
     reference: 0,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Enum)]
+pub enum VertexFormat {
+    FlatColor,
+    Textured,
+}

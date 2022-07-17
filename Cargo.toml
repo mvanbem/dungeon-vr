@@ -1,5 +1,5 @@
 [package]
-name = "vrgame"
+name = "dungeon-vr"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
@@ -9,13 +9,16 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 ash = { version = "0.37", default-features = false, features = ["loaded"] }
+bevy_ecs = "0.7"
 bytemuck = { version = "1", features = ["derive"] }
 cgmath = "0.18"
 cstr = "0.2"
-ctrlc = "3.1"
+ctrlc = "3"
+enum-map = "2"
 gltf = { version = "1", features = ["utils"] }
 memoffset = "0.6"
 openxr = { version = "0.16", features = ["static"] }
+slotmap = "1"
 
 [build-dependencies]
 anyhow = "1"
