@@ -18,6 +18,7 @@ enum-map = "2"
 gltf = { version = "1", features = ["utils"] }
 memoffset = "0.6"
 openxr = { version = "0.16", features = ["static"] }
+ordered-float = "3"
 slotmap = "1"
 
 [build-dependencies]

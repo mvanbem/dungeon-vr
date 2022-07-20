@@ -1,5 +1,6 @@
 use bevy_ecs::prelude::*;
-use cgmath::{vec3, Decomposed, Matrix4, Quaternion, Vector3, Zero};
+use cgmath::{vec3, Decomposed, Deg, InnerSpace, Matrix4, One, Quaternion, Rotation3, Vector3};
+use ordered_float::NotNan;
 use slotmap::SecondaryMap;
 
 use crate::asset::{MeshAssetKey, MeshAssets};
@@ -9,11 +10,7 @@ struct Transform(Decomposed<Vector3<f32>, Quaternion<f32>>);
 
 impl Default for Transform {
     fn default() -> Self {
-        Self(Decomposed {
-            scale: 1.0,
-            rot: Quaternion::zero(),
-            disp: Vector3::zero(),
-        })
+        Self(One::one())
     }
 }
 
@@ -25,6 +22,17 @@ struct MeshRenderer {
 #[derive(Component)]
 struct Hand {
     index: usize,
+    grab_state: HandGrabState,
+}
+
+enum HandGrabState {
+    Empty,
+    Grabbing(Entity),
+}
+
+#[derive(Component)]
+struct Grabbable {
+    grabbed: bool,
 }
 
 pub struct VrTracking {
@@ -34,6 +42,27 @@ pub struct VrTracking {
 
 pub struct VrHand {
     pub pose: openxr::Posef,
+    pub squeeze: f32,
+    pub squeeze_force: f32,
+}
+
+impl VrHand {
+    fn to_decomposed(&self) -> Decomposed<Vector3<f32>, Quaternion<f32>> {
+        Decomposed {
+            scale: 1.0,
+            rot: Quaternion::new(
+                self.pose.orientation.w,
+                self.pose.orientation.x,
+                self.pose.orientation.y,
+                self.pose.orientation.z,
+            ),
+            disp: vec3(
+                self.pose.position.x,
+                self.pose.position.y,
+                self.pose.position.z,
+            ),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -55,23 +84,86 @@ impl Game {
                 .insert(MeshRenderer {
                     mesh_key: mesh_assets.load("placeholder"),
                 })
-                .insert(Hand { index });
+                .insert(Hand {
+                    index,
+                    grab_state: HandGrabState::Empty,
+                });
         }
 
-        for x in -1..=1 {
-            for z in -1..=1 {
-                world
-                    .spawn()
-                    .insert(Transform(Decomposed {
-                        scale: 1.0,
-                        rot: Quaternion::zero(),
-                        disp: vec3(4.0 * x as f32, 0.0, 4.0 * z as f32),
-                    }))
-                    .insert(MeshRenderer {
-                        mesh_key: mesh_assets.load("LowPolyDungeon/FloorTile"),
-                    });
-            }
+        world
+            .spawn()
+            .insert(Transform(Decomposed {
+                disp: vec3(0.0, 0.0, 0.0),
+                ..One::one()
+            }))
+            .insert(MeshRenderer {
+                mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Custom_Center"),
+            });
+        for side in 0..4 {
+            let rot = Quaternion::from_angle_y(Deg(90.0) * side as f32);
+            world
+                .spawn()
+                .insert(Transform(Decomposed {
+                    rot,
+                    disp: rot * vec3(0.0, 0.0, -4.0),
+                    ..One::one()
+                }))
+                .insert(MeshRenderer {
+                    mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Custom_Border_Flat"),
+                });
+            world
+                .spawn()
+                .insert(Transform(Decomposed {
+                    rot,
+                    disp: rot * vec3(0.0, 0.0, -4.0),
+                    ..One::one()
+                }))
+                .insert(MeshRenderer {
+                    mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Wall_Var1"),
+                });
+
+            world
+                .spawn()
+                .insert(Transform(Decomposed {
+                    rot,
+                    disp: rot * vec3(4.0, 0.0, 4.0),
+                    ..One::one()
+                }))
+                .insert(MeshRenderer {
+                    mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Custom_Corner_Flat"),
+                });
+            world
+                .spawn()
+                .insert(Transform(Decomposed {
+                    rot,
+                    disp: rot * vec3(-4.0, 0.0, -4.0),
+                    ..One::one()
+                }))
+                .insert(MeshRenderer {
+                    mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Wall_Var1"),
+                });
+            world
+                .spawn()
+                .insert(Transform(Decomposed {
+                    rot,
+                    disp: rot * vec3(4.0, 0.0, -4.0),
+                    ..One::one()
+                }))
+                .insert(MeshRenderer {
+                    mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Wall_Var1"),
+                });
         }
+
+        world
+            .spawn()
+            .insert(Transform(Decomposed {
+                disp: vec3(0.0, 1.0, 0.0),
+                ..One::one()
+            }))
+            .insert(MeshRenderer {
+                mesh_key: mesh_assets.load("LowPolyDungeon/Key_Silver"),
+            })
+            .insert(Grabbable { grabbed: false });
 
         let mut schedule = Schedule::default();
         schedule.add_stage("update", SystemStage::parallel().with_system(update_hands));
@@ -97,19 +189,59 @@ impl Game {
     }
 }
 
-fn update_hands(mut query: Query<(&mut Transform, &Hand)>, vr_tracking: Res<VrTracking>) {
-    for (mut transform, hand) in query.iter_mut() {
-        let pose = &vr_tracking.hands[hand.index].pose;
-        transform.0 = Decomposed {
-            scale: 1.0,
-            rot: Quaternion::new(
-                pose.orientation.w,
-                pose.orientation.x,
-                pose.orientation.y,
-                pose.orientation.z,
-            ),
-            disp: vec3(pose.position.x, pose.position.y, pose.position.z),
-        };
+fn update_hands(
+    mut query: Query<(&mut Transform, &mut Hand), Without<Grabbable>>,
+    vr_tracking: Res<VrTracking>,
+    mut grabbable_query: Query<(Entity, &mut Transform, &mut Grabbable)>,
+) {
+    for (mut transform, mut hand) in query.iter_mut() {
+        let vr_hand = &vr_tracking.hands[hand.index];
+        transform.0 = vr_hand.to_decomposed();
+
+        // Step the grab state machine.
+        match hand.grab_state {
+            HandGrabState::Empty => {
+                if vr_hand.squeeze_force > 0.2 {
+                    if let Some((_, entity, _, mut grabbable)) = grabbable_query
+                        .iter_mut()
+                        .filter_map(|(entity, grabbable_transform, grabbable)| {
+                            if grabbable.grabbed {
+                                return None;
+                            }
+                            let dist = (grabbable_transform.0.disp - transform.0.disp).magnitude();
+                            if dist <= 0.1 {
+                                Some((dist, entity, grabbable_transform, grabbable))
+                            } else {
+                                None
+                            }
+                        })
+                        .min_by_key(|(dist, _, _, _)| NotNan::new(*dist).unwrap())
+                    {
+                        // Start grabbing.
+                        hand.grab_state = HandGrabState::Grabbing(entity);
+                        grabbable.grabbed = true;
+                    }
+                }
+            }
+            HandGrabState::Grabbing(entity) => {
+                if vr_hand.squeeze < 0.8 {
+                    // End grabbing.
+                    hand.grab_state = HandGrabState::Empty;
+                    grabbable_query
+                        .get_component_mut::<Grabbable>(entity)
+                        .unwrap()
+                        .grabbed = false;
+                }
+            }
+        }
+
+        // Update a held object.
+        if let HandGrabState::Grabbing(entity) = hand.grab_state {
+            grabbable_query
+                .get_component_mut::<Transform>(entity)
+                .unwrap()
+                .0 = transform.0;
+        }
     }
 }
 

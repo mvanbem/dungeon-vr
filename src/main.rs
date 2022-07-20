@@ -5,7 +5,7 @@ use std::time::Duration;
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use cgmath::{frustum, vec3, Matrix4, Quaternion, Transform};
-use enum_map::{Enum, EnumMap};
+use enum_map::Enum;
 use openxr as xr;
 use slotmap::SecondaryMap;
 
@@ -15,7 +15,7 @@ use crate::render_data::RenderData;
 use crate::swapchain::Swapchain;
 use crate::vk_handles::VkHandles;
 use crate::xr_handles::XrHandles;
-use crate::xr_session::XrSession;
+use crate::xr_session::{XrSession, XrSessionHand};
 
 mod asset;
 mod flat_color;
@@ -287,51 +287,42 @@ fn main_loop<'a>(
         xrs.session
             .sync_actions(&[(&xrs.action_set).into()])
             .unwrap();
+        let capture_hand = |hand: &XrSessionHand| VrHand {
+            pose: if hand
+                .pose_action
+                .is_active(&xrs.session, xr::Path::NULL)
+                .unwrap()
+            {
+                hand.pose_space
+                    .locate(&xrs.stage, xr_frame_state.predicted_display_time)
+                    .unwrap()
+                    .pose
+            } else {
+                xr::Posef::IDENTITY
+            },
+            squeeze: hand
+                .squeeze_action
+                .state(&xrs.session, xr::Path::NULL)
+                .unwrap()
+                .current_state,
+            squeeze_force: hand
+                .squeeze_force_action
+                .state(&xrs.session, xr::Path::NULL)
+                .unwrap()
+                .current_state,
+        };
         let vr_tracking = VrTracking {
             head: xr::Posef::IDENTITY,
-            hands: [
-                VrHand {
-                    pose: if xrs
-                        .left_action
-                        .is_active(&xrs.session, xr::Path::NULL)
-                        .unwrap()
-                    {
-                        xrs.left_space
-                            .locate(&xrs.stage, xr_frame_state.predicted_display_time)
-                            .unwrap()
-                            .pose
-                    } else {
-                        xr::Posef::IDENTITY
-                    },
-                },
-                VrHand {
-                    pose: if xrs
-                        .right_action
-                        .is_active(&xrs.session, xr::Path::NULL)
-                        .unwrap()
-                    {
-                        xrs.right_space
-                            .locate(&xrs.stage, xr_frame_state.predicted_display_time)
-                            .unwrap()
-                            .pose
-                    } else {
-                        xr::Posef::IDENTITY
-                    },
-                },
-            ],
+            hands: [capture_hand(&xrs.hands[0]), capture_hand(&xrs.hands[1])],
         };
 
         // Step the game and extract rendering data.
         let meshes = game.update(vr_tracking);
 
         // Group mesh instances.
-        let mut sorted_meshes: EnumMap<
-            VertexFormat,
-            SecondaryMap<MeshAssetKey, Vec<Matrix4<f32>>>,
-        > = Default::default();
+        let mut sorted_meshes: SecondaryMap<MeshAssetKey, Vec<Matrix4<f32>>> = Default::default();
         for (mesh_key, transforms) in meshes {
-            let mesh = mesh_assets.get(mesh_key);
-            sorted_meshes[mesh.vertex_format]
+            sorted_meshes
                 .entry(mesh_key)
                 .unwrap()
                 .or_default()
@@ -349,33 +340,37 @@ fn main_loop<'a>(
                 &[],
             );
         }
-        for (vertex_format, meshes) in sorted_meshes {
-            match vertex_format {
-                VertexFormat::FlatColor => unsafe {
-                    vk.device().cmd_bind_pipeline(
-                        cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        render.flat_color_pipeline,
-                    );
-                },
-                VertexFormat::Textured => unsafe {
-                    vk.device().cmd_bind_pipeline(
-                        cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        render.textured_pipeline,
-                    );
-                },
-            }
+        for (mesh_key, transforms) in sorted_meshes {
+            let mesh = mesh_assets.get(mesh_key);
+            for primitive in &mesh.primitives {
+                match primitive.vertex_format {
+                    VertexFormat::FlatColor => unsafe {
+                        vk.device().cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            render.flat_color_pipeline,
+                        );
+                    },
+                    VertexFormat::Textured => unsafe {
+                        vk.device().cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            render.textured_pipeline,
+                        );
+                    },
+                }
 
-            for (mesh_key, transforms) in meshes {
-                let mesh = mesh_assets.get(mesh_key);
                 unsafe {
                     vk.device()
-                        .cmd_bind_vertex_buffers(cmd, 0, &[mesh.vertex_buffer], &[0]);
-                    vk.device()
-                        .cmd_bind_index_buffer(cmd, mesh.index_buffer, 0, mesh.index_type);
+                        .cmd_bind_vertex_buffers(cmd, 0, &[primitive.vertex_buffer], &[0]);
+                    vk.device().cmd_bind_index_buffer(
+                        cmd,
+                        primitive.index_buffer,
+                        0,
+                        primitive.index_type,
+                    );
                 }
-                for model in transforms {
+                for model in &transforms {
                     unsafe {
                         vk.device().cmd_push_constants(
                             cmd,
@@ -387,7 +382,7 @@ fn main_loop<'a>(
                             }),
                         );
                         vk.device()
-                            .cmd_draw_indexed(cmd, mesh.count as u32, 1, 0, 0, 0);
+                            .cmd_draw_indexed(cmd, primitive.count as u32, 1, 0, 0, 0);
                     }
                 }
             }

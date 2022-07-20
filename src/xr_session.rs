@@ -15,10 +15,16 @@ pub struct XrSession<'a> {
 
     pub stage: xr::Space,
     pub action_set: xr::ActionSet,
-    pub left_action: xr::Action<xr::Posef>,
-    pub right_action: xr::Action<xr::Posef>,
-    pub left_space: xr::Space,
-    pub right_space: xr::Space,
+    pub hands: [XrSessionHand<'a>; 2],
+}
+
+pub struct XrSessionHand<'a> {
+    phantom_lifetime: PhantomData<&'a XrSession<'a>>,
+
+    pub pose_action: xr::Action<xr::Posef>,
+    pub pose_space: xr::Space,
+    pub squeeze_action: xr::Action<f32>,
+    pub squeeze_force_action: xr::Action<f32>,
 }
 
 impl<'a> XrSession<'a> {
@@ -36,19 +42,18 @@ impl<'a> XrSession<'a> {
             )
         }
         .unwrap();
-
-        // Create an action set to encapsulate our actions
+        let stage = session
+            .create_reference_space(xr::ReferenceSpaceType::STAGE, xr::Posef::IDENTITY)
+            .unwrap();
         let action_set = xr
             .instance
             .create_action_set("input", "input pose information", 0)
             .unwrap();
 
-        let left_action = action_set
-            .create_action::<xr::Posef>("left_hand", "Left Hand Controller", &[])
-            .unwrap();
-        let right_action = action_set
-            .create_action::<xr::Posef>("right_hand", "Right Hand Controller", &[])
-            .unwrap();
+        let hands = [
+            XrSessionHand::new(&session, &action_set, 0),
+            XrSessionHand::new(&session, &action_set, 1),
+        ];
 
         // Bind our actions to input devices using the given profile
         // If you want to access inputs specific to a particular device you may specify a different
@@ -59,39 +64,18 @@ impl<'a> XrSession<'a> {
                     .string_to_path("/interaction_profiles/valve/index_controller")
                     .unwrap(),
                 &[
-                    xr::Binding::new(
-                        &left_action,
-                        xr.instance
-                            .string_to_path("/user/hand/left/input/grip/pose")
-                            .unwrap(),
-                    ),
-                    xr::Binding::new(
-                        &right_action,
-                        xr.instance
-                            .string_to_path("/user/hand/right/input/grip/pose")
-                            .unwrap(),
-                    ),
+                    hands[0].pose_binding(xr, 0),
+                    hands[1].pose_binding(xr, 1),
+                    hands[0].squeeze_binding(xr, 0),
+                    hands[1].squeeze_binding(xr, 1),
+                    hands[0].squeeze_force_binding(xr, 0),
+                    hands[1].squeeze_force_binding(xr, 1),
                 ],
             )
             .unwrap();
 
         // Attach the action set to the session
         session.attach_action_sets(&[&action_set]).unwrap();
-
-        // Create an action space for each device we want to locate
-        let left_space = left_action
-            .create_space(session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
-            .unwrap();
-        let right_space = right_action
-            .create_space(session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
-            .unwrap();
-
-        // OpenXR uses a couple different types of reference frames for positioning content; we need
-        // to choose one for displaying our content! STAGE would be relative to the center of your
-        // guardian system's bounds, and LOCAL would be relative to your device's starting location.
-        let stage = session
-            .create_reference_space(xr::ReferenceSpaceType::STAGE, xr::Posef::IDENTITY)
-            .unwrap();
 
         Self {
             phantom_lifetime: PhantomData,
@@ -102,10 +86,92 @@ impl<'a> XrSession<'a> {
 
             stage,
             action_set,
-            left_action,
-            right_action,
-            left_space,
-            right_space,
+            hands,
         }
+    }
+}
+
+impl<'a> XrSessionHand<'a> {
+    pub fn new(
+        session: &xr::Session<xr::Vulkan>,
+        action_set: &xr::ActionSet,
+        index: usize,
+    ) -> Self {
+        let pose_action = action_set
+            .create_action::<xr::Posef>(
+                ["left_hand", "right_hand"][index],
+                ["Left Hand Controller", "Right Hand Controller"][index],
+                &[],
+            )
+            .unwrap();
+        let pose_space = pose_action
+            .create_space(session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
+            .unwrap();
+
+        let squeeze_action = action_set
+            .create_action::<f32>(
+                ["left_squeeze", "right_squeeze"][index],
+                ["Left Hand Squeeze", "Right Hand Squeeze"][index],
+                &[],
+            )
+            .unwrap();
+        let squeeze_force_action = action_set
+            .create_action::<f32>(
+                ["left_squeeze_force", "right_squeeze_force"][index],
+                ["Left Hand Squeeze Force", "Right Hand Squeeze Force"][index],
+                &[],
+            )
+            .unwrap();
+
+        Self {
+            phantom_lifetime: PhantomData,
+
+            pose_action,
+            pose_space,
+            squeeze_action,
+            squeeze_force_action,
+        }
+    }
+
+    fn pose_binding<'b>(&'b self, xr: &'b XrHandles, index: usize) -> xr::Binding<'b> {
+        xr::Binding::new(
+            &self.pose_action,
+            xr.instance
+                .string_to_path(
+                    [
+                        "/user/hand/left/input/grip/pose",
+                        "/user/hand/right/input/grip/pose",
+                    ][index],
+                )
+                .unwrap(),
+        )
+    }
+
+    fn squeeze_binding<'b>(&'b self, xr: &'b XrHandles, index: usize) -> xr::Binding<'b> {
+        xr::Binding::new(
+            &self.squeeze_action,
+            xr.instance
+                .string_to_path(
+                    [
+                        "/user/hand/left/input/squeeze/value",
+                        "/user/hand/right/input/squeeze/value",
+                    ][index],
+                )
+                .unwrap(),
+        )
+    }
+
+    fn squeeze_force_binding<'b>(&'b self, xr: &'b XrHandles, index: usize) -> xr::Binding<'b> {
+        xr::Binding::new(
+            &self.squeeze_force_action,
+            xr.instance
+                .string_to_path(
+                    [
+                        "/user/hand/left/input/squeeze/force",
+                        "/user/hand/right/input/squeeze/force",
+                    ][index],
+                )
+                .unwrap(),
+        )
     }
 }
