@@ -20,6 +20,6 @@ void main()  {
     gl_Position = u_matrices.viewProj[gl_ViewIndex]
         * push_constants.model
         * vec4(a_position, 1.0);
-    v_normal = a_normal;
+    v_normal = (push_constants.model * vec4(a_normal, 0.0)).xyz;
     v_texcoord = a_texcoord;
 }
