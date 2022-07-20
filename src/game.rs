@@ -35,11 +35,18 @@ struct Grabbable {
     grabbed: bool,
 }
 
+struct VrTrackingState {
+    current: VrTracking,
+    prev: VrTracking,
+}
+
+#[derive(Clone, Copy, Default)]
 pub struct VrTracking {
     pub head: openxr::Posef,
     pub hands: [VrHand; 2],
 }
 
+#[derive(Clone, Copy, Default)]
 pub struct VrHand {
     pub pose: openxr::Posef,
     pub squeeze: f32,
@@ -71,6 +78,7 @@ struct Meshes(SecondaryMap<MeshAssetKey, Vec<Matrix4<f32>>>);
 pub struct Game {
     world: World,
     schedule: Schedule,
+    prev_vr_tracking: VrTracking,
 }
 
 impl Game {
@@ -82,7 +90,7 @@ impl Game {
                 .spawn()
                 .insert(Transform::default())
                 .insert(MeshRenderer {
-                    mesh_key: mesh_assets.load("placeholder"),
+                    mesh_key: mesh_assets.load(["left_hand", "right_hand"][index]),
                 })
                 .insert(Hand {
                     index,
@@ -173,7 +181,11 @@ impl Game {
             SystemStage::parallel().with_system(gather_meshes),
         );
 
-        Self { world, schedule }
+        Self {
+            world,
+            schedule,
+            prev_vr_tracking: Default::default(),
+        }
     }
 
     pub fn update(
@@ -181,27 +193,36 @@ impl Game {
         vr_tracking: VrTracking,
     ) -> SecondaryMap<MeshAssetKey, Vec<Matrix4<f32>>> {
         self.world.insert_resource(Meshes::default());
-        self.world.insert_resource(vr_tracking);
+        self.world.insert_resource(VrTrackingState {
+            current: vr_tracking,
+            prev: self.prev_vr_tracking,
+        });
 
         self.schedule.run(&mut self.world);
 
+        self.prev_vr_tracking = vr_tracking;
         self.world.remove_resource::<Meshes>().unwrap().0
     }
 }
 
 fn update_hands(
     mut query: Query<(&mut Transform, &mut Hand), Without<Grabbable>>,
-    vr_tracking: Res<VrTracking>,
+    vr_tracking: Res<VrTrackingState>,
     mut grabbable_query: Query<(Entity, &mut Transform, &mut Grabbable)>,
 ) {
     for (mut transform, mut hand) in query.iter_mut() {
-        let vr_hand = &vr_tracking.hands[hand.index];
-        transform.0 = vr_hand.to_decomposed();
+        let vr_hand = &vr_tracking.current.hands[hand.index];
+        let prev_vr_hand = &vr_tracking.prev.hands[hand.index];
+        transform.0 = vr_hand.to_decomposed()
+            * Decomposed {
+                rot: Quaternion::from_angle_x(Deg(25.0)),
+                ..One::one()
+            };
 
         // Step the grab state machine.
         match hand.grab_state {
             HandGrabState::Empty => {
-                if vr_hand.squeeze_force > 0.2 {
+                if vr_hand.squeeze_force > 0.2 && prev_vr_hand.squeeze_force <= 0.2 {
                     if let Some((_, entity, _, mut grabbable)) = grabbable_query
                         .iter_mut()
                         .filter_map(|(entity, grabbable_transform, grabbable)| {
