@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 use std::mem::size_of;
 
 use ash::vk;
-use cgmath::Matrix4;
+use rapier3d::na::Matrix4;
 
 use crate::vk_handles::VkHandles;
 use crate::{

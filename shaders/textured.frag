@@ -8,10 +8,5 @@ void main() {
     const vec3 LIGHT_DIR = normalize(vec3(0.1, 1.0, 0.3));
     float ndotl = dot(v_normal, LIGHT_DIR) * 0.5 + 0.5;
     
-    f_color = vec4(
-        mix(
-            vec3(26.0/255.0, 32.0/255.0, 52.0/255.0),
-            vec3(255.0/255.0, 217.0/255.0, 127.0/255.0),
-            ndotl),
-        1);
+    f_color = vec4(vec3(ndotl), 1);
 }

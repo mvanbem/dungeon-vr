@@ -1,16 +1,19 @@
+use std::f32::consts::{FRAC_PI_2, PI};
+
 use bevy_ecs::prelude::*;
-use cgmath::{vec3, Decomposed, Deg, InnerSpace, Matrix4, One, Quaternion, Rotation3, Vector3};
 use ordered_float::NotNan;
+use rapier3d::na::{self, Isometry3, Matrix4, Translation, UnitQuaternion};
+use rapier3d::prelude::*;
 use slotmap::SecondaryMap;
 
 use crate::asset::{MeshAssetKey, MeshAssets};
 
 #[derive(Component)]
-struct Transform(Decomposed<Vector3<f32>, Quaternion<f32>>);
+struct Transform(Isometry3<f32>);
 
 impl Default for Transform {
     fn default() -> Self {
-        Self(One::one())
+        Self(na::one())
     }
 }
 
@@ -35,6 +38,11 @@ struct Grabbable {
     grabbed: bool,
 }
 
+#[derive(Component)]
+struct RigidBody {
+    handle: RigidBodyHandle,
+}
+
 struct VrTrackingState {
     current: VrTracking,
     prev: VrTracking,
@@ -48,28 +56,9 @@ pub struct VrTracking {
 
 #[derive(Clone, Copy, Default)]
 pub struct VrHand {
-    pub pose: openxr::Posef,
+    pub pose: Isometry3<f32>,
     pub squeeze: f32,
     pub squeeze_force: f32,
-}
-
-impl VrHand {
-    fn to_decomposed(&self) -> Decomposed<Vector3<f32>, Quaternion<f32>> {
-        Decomposed {
-            scale: 1.0,
-            rot: Quaternion::new(
-                self.pose.orientation.w,
-                self.pose.orientation.x,
-                self.pose.orientation.y,
-                self.pose.orientation.z,
-            ),
-            disp: vec3(
-                self.pose.position.x,
-                self.pose.position.y,
-                self.pose.position.z,
-            ),
-        }
-    }
 }
 
 #[derive(Default)]
@@ -81,9 +70,24 @@ pub struct Game {
     prev_vr_tracking: VrTracking,
 }
 
+struct GamePhysics {
+    bodies: RigidBodySet,
+    colliders: ColliderSet,
+    integration_parameters: IntegrationParameters,
+    physics_pipeline: PhysicsPipeline,
+    islands: IslandManager,
+    broad_phase: BroadPhase,
+    narrow_phase: NarrowPhase,
+    impulse_joints: ImpulseJointSet,
+    multibody_joints: MultibodyJointSet,
+    ccd_solver: CCDSolver,
+}
+
 impl Game {
     pub fn new(mesh_assets: &mut MeshAssets) -> Self {
         let mut world = World::new();
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
 
         for index in 0..2 {
             world
@@ -100,86 +104,123 @@ impl Game {
 
         world
             .spawn()
-            .insert(Transform(Decomposed {
-                disp: vec3(0.0, 0.0, 0.0),
-                ..One::one()
-            }))
+            .insert(Transform(vector![0.0, 0.0, 0.0].into()))
             .insert(MeshRenderer {
                 mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Custom_Center"),
             });
+        colliders.insert(
+            ColliderBuilder::cuboid(2.0, 2.0, 2.0).position(vector![0.0, -2.0, 0.0].into()),
+        );
         for side in 0..4 {
-            let rot = Quaternion::from_angle_y(Deg(90.0) * side as f32);
+            let rot = UnitQuaternion::from_scaled_axis(vector![0.0, FRAC_PI_2, 0.0] * side as f32);
             world
                 .spawn()
-                .insert(Transform(Decomposed {
+                .insert(Transform(Isometry3::from_parts(
+                    (rot * vector![0.0, 0.0, -4.0]).into(),
                     rot,
-                    disp: rot * vec3(0.0, 0.0, -4.0),
-                    ..One::one()
-                }))
+                )))
                 .insert(MeshRenderer {
                     mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Custom_Border_Flat"),
                 });
             world
                 .spawn()
-                .insert(Transform(Decomposed {
+                .insert(Transform(Isometry3::from_parts(
+                    (rot * vector![0.0, 0.0, -4.0]).into(),
                     rot,
-                    disp: rot * vec3(0.0, 0.0, -4.0),
-                    ..One::one()
-                }))
+                )))
                 .insert(MeshRenderer {
                     mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Wall_Var1"),
                 });
 
             world
                 .spawn()
-                .insert(Transform(Decomposed {
+                .insert(Transform(Isometry3::from_parts(
+                    (rot * vector![4.0, 0.0, 4.0]).into(),
                     rot,
-                    disp: rot * vec3(4.0, 0.0, 4.0),
-                    ..One::one()
-                }))
+                )))
                 .insert(MeshRenderer {
                     mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Custom_Corner_Flat"),
                 });
             world
                 .spawn()
-                .insert(Transform(Decomposed {
+                .insert(Transform(Isometry3::from_parts(
+                    (rot * vector![-4.0, 0.0, -4.0]).into(),
                     rot,
-                    disp: rot * vec3(-4.0, 0.0, -4.0),
-                    ..One::one()
-                }))
+                )))
                 .insert(MeshRenderer {
                     mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Wall_Var1"),
                 });
             world
                 .spawn()
-                .insert(Transform(Decomposed {
+                .insert(Transform(Isometry3::from_parts(
+                    (rot * vector![4.0, 0.0, -4.0]).into(),
                     rot,
-                    disp: rot * vec3(4.0, 0.0, -4.0),
-                    ..One::one()
-                }))
+                )))
                 .insert(MeshRenderer {
                     mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Wall_Var1"),
                 });
         }
 
+        let key_body = bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(vector![0.0, 1.0, 0.0])
+                .build(),
+        );
+        colliders.insert_with_parent(
+            ColliderBuilder::cuboid(0.05, 0.05, 0.05),
+            key_body,
+            &mut bodies,
+        );
         world
             .spawn()
-            .insert(Transform(Decomposed {
-                disp: vec3(0.0, 1.0, 0.0),
-                ..One::one()
-            }))
+            .insert(Transform(vector![0.0, 1.0, 0.0].into()))
             .insert(MeshRenderer {
                 mesh_key: mesh_assets.load("LowPolyDungeon/Key_Silver"),
             })
-            .insert(Grabbable { grabbed: false });
+            .insert(Grabbable { grabbed: false })
+            .insert(RigidBody { handle: key_body });
 
         let mut schedule = Schedule::default();
-        schedule.add_stage("update", SystemStage::parallel().with_system(update_hands));
+        schedule.add_stage(
+            "reset_forces",
+            SystemStage::parallel().with_system(reset_forces),
+        );
         schedule.add_stage_after(
-            "update",
+            "reset_forces",
+            "pre_step",
+            SystemStage::parallel().with_system(update_hands),
+        );
+        schedule.add_stage_after(
+            "pre_step",
+            "physics_step",
+            SystemStage::parallel().with_system(physics_step),
+        );
+        schedule.add_stage_after(
+            "physics_step",
+            "post_step",
+            SystemStage::parallel().with_system(update_rigid_body_transforms),
+        );
+        schedule.add_stage_after(
+            "post_step",
             "render",
             SystemStage::parallel().with_system(gather_meshes),
         );
+
+        world.insert_resource(GamePhysics {
+            bodies,
+            colliders,
+            integration_parameters: IntegrationParameters {
+                dt: 1.0 / 120.0,
+                ..Default::default()
+            },
+            physics_pipeline: PhysicsPipeline::new(),
+            islands: IslandManager::new(),
+            broad_phase: BroadPhase::new(),
+            narrow_phase: NarrowPhase::new(),
+            impulse_joints: ImpulseJointSet::new(),
+            multibody_joints: MultibodyJointSet::new(),
+            ccd_solver: CCDSolver::new(),
+        });
 
         Self {
             world,
@@ -205,19 +246,26 @@ impl Game {
     }
 }
 
+fn reset_forces(mut physics: ResMut<GamePhysics>) {
+    for (_, body) in physics.bodies.iter_mut() {
+        body.reset_forces(false);
+    }
+}
+
 fn update_hands(
     mut query: Query<(&mut Transform, &mut Hand), Without<Grabbable>>,
     vr_tracking: Res<VrTrackingState>,
-    mut grabbable_query: Query<(Entity, &mut Transform, &mut Grabbable)>,
+    mut grabbable_query: Query<(Entity, &mut Transform, &mut Grabbable, &RigidBody)>,
+    mut physics: ResMut<GamePhysics>,
 ) {
     for (mut transform, mut hand) in query.iter_mut() {
         let vr_hand = &vr_tracking.current.hands[hand.index];
         let prev_vr_hand = &vr_tracking.prev.hands[hand.index];
-        transform.0 = vr_hand.to_decomposed()
-            * Decomposed {
-                rot: Quaternion::from_angle_x(Deg(25.0)),
-                ..One::one()
-            };
+        transform.0 = vr_hand.pose
+            * Isometry3::from_parts(
+                Translation::default(),
+                UnitQuaternion::from_scaled_axis(vector![25.0 * PI / 180.0, 0.0, 0.0]),
+            );
 
         // Step the grab state machine.
         match hand.grab_state {
@@ -225,11 +273,13 @@ fn update_hands(
                 if vr_hand.squeeze_force > 0.2 && prev_vr_hand.squeeze_force <= 0.2 {
                     if let Some((_, entity, _, mut grabbable)) = grabbable_query
                         .iter_mut()
-                        .filter_map(|(entity, grabbable_transform, grabbable)| {
+                        .filter_map(|(entity, grabbable_transform, grabbable, _)| {
                             if grabbable.grabbed {
                                 return None;
                             }
-                            let dist = (grabbable_transform.0.disp - transform.0.disp).magnitude();
+                            let dist = (grabbable_transform.0.translation.vector
+                                - transform.0.translation.vector)
+                                .magnitude();
                             if dist <= 0.1 {
                                 Some((dist, entity, grabbable_transform, grabbable))
                             } else {
@@ -258,11 +308,64 @@ fn update_hands(
 
         // Update a held object.
         if let HandGrabState::Grabbing(entity) = hand.grab_state {
-            grabbable_query
-                .get_component_mut::<Transform>(entity)
+            let inv_dt = 1.0 / physics.integration_parameters.dt;
+            let rigid_body = &mut physics.bodies[grabbable_query
+                .get_component::<RigidBody>(entity)
                 .unwrap()
-                .0 = transform.0;
+                .handle];
+
+            let goal_pos = transform.0.translation.vector;
+            let pos_correction = goal_pos - rigid_body.position().translation.vector;
+            let one_step_vel = pos_correction * inv_dt;
+            rigid_body.set_linvel(one_step_vel, true);
+
+            let goal_rot = transform.0.rotation;
+            let rot_correction = goal_rot * rigid_body.rotation().inverse();
+            let one_step_angvel = match rot_correction.axis_angle() {
+                Some((axis, angle)) => (angle * inv_dt) * axis.into_inner(),
+                None => na::zero(),
+            };
+            rigid_body.set_angvel(one_step_angvel, true);
         }
+    }
+}
+
+fn physics_step(mut physics: ResMut<GamePhysics>) {
+    let GamePhysics {
+        bodies,
+        colliders,
+        integration_parameters,
+        physics_pipeline,
+        islands,
+        broad_phase,
+        narrow_phase,
+        impulse_joints,
+        multibody_joints,
+        ccd_solver,
+    } = &mut *physics;
+    physics_pipeline.step(
+        &(vector![0.0, -9.81, 0.0]),
+        &integration_parameters,
+        islands,
+        broad_phase,
+        narrow_phase,
+        bodies,
+        colliders,
+        impulse_joints,
+        multibody_joints,
+        ccd_solver,
+        &(),
+        &(),
+    );
+}
+
+fn update_rigid_body_transforms(
+    mut query: Query<(&mut Transform, &RigidBody)>,
+    physics: Res<GamePhysics>,
+) {
+    for (mut transform, rigid_body) in query.iter_mut() {
+        let body = &physics.bodies[rigid_body.handle];
+        transform.0 = Isometry3::from_parts((*body.translation()).into(), *body.rotation());
     }
 }
 
@@ -273,6 +376,6 @@ fn gather_meshes(query: Query<(&Transform, &MeshRenderer)>, mut meshes: ResMut<M
             .entry(mesh_renderer.mesh_key)
             .unwrap()
             .or_default()
-            .push(transform.0.into());
+            .push(transform.0.to_matrix());
     }
 }

@@ -4,13 +4,15 @@ use std::time::Duration;
 
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use cgmath::{frustum, vec3, Matrix4, Quaternion, Transform};
 use enum_map::Enum;
 use openxr as xr;
+use rapier3d::na::{self as nalgebra};
+use rapier3d::na::{self, matrix, vector, Matrix4};
 use slotmap::SecondaryMap;
 
 use crate::asset::{MeshAssetKey, MeshAssets};
 use crate::game::{Game, VrHand, VrTracking};
+use crate::interop::xr_posef_to_na_isometry;
 use crate::render_data::RenderData;
 use crate::swapchain::Swapchain;
 use crate::vk_handles::VkHandles;
@@ -20,6 +22,7 @@ use crate::xr_session::{XrSession, XrSessionHand};
 mod asset;
 mod flat_color;
 mod game;
+mod interop;
 mod mesh;
 mod render_data;
 mod swapchain;
@@ -83,23 +86,7 @@ fn set_ctrlc_handler() -> Arc<AtomicBool> {
 }
 
 fn build_view_matrix(view: xr::View) -> Matrix4<f32> {
-    cgmath::Decomposed {
-        scale: 1.0,
-        rot: Quaternion::new(
-            view.pose.orientation.w,
-            view.pose.orientation.x,
-            view.pose.orientation.y,
-            view.pose.orientation.z,
-        ),
-        disp: vec3(
-            view.pose.position.x,
-            view.pose.position.y,
-            view.pose.position.z,
-        ),
-    }
-    .inverse_transform()
-    .unwrap()
-    .into()
+    xr_posef_to_na_isometry(view.pose).inverse().to_matrix()
 }
 
 fn build_projection_matrix(fov: xr::Fovf) -> Matrix4<f32> {
@@ -117,7 +104,15 @@ fn build_projection_matrix(fov: xr::Fovf) -> Matrix4<f32> {
         near_z * up,
         near_z,
         far_z,
-    ) * Matrix4::from_nonuniform_scale(1.0, -1.0, 1.0)
+    ) * Matrix4::from_diagonal(&vector![1.0, -1.0, 1.0, 1.0])
+}
+
+// Like glFrustum.
+fn frustum(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> Matrix4<f32> {
+    matrix![(2.0 * near) / (right - left), 0.0, (right + left) / (right - left), 0.0;
+            0.0, (2.0 * near) / (top - bottom), (top + bottom) / (top - bottom), 0.0;
+            0.0, 0.0, -(far + near) / (far - near), -(2.0 * far * near) / (far - near);
+            0.0, 0.0, -1.0, 0.0]
 }
 
 fn main_loop<'a>(
@@ -293,12 +288,14 @@ fn main_loop<'a>(
                 .is_active(&xrs.session, xr::Path::NULL)
                 .unwrap()
             {
-                hand.pose_space
-                    .locate(&xrs.stage, xr_frame_state.predicted_display_time)
-                    .unwrap()
-                    .pose
+                xr_posef_to_na_isometry(
+                    hand.pose_space
+                        .locate(&xrs.stage, xr_frame_state.predicted_display_time)
+                        .unwrap()
+                        .pose,
+                )
             } else {
-                xr::Posef::IDENTITY
+                na::one()
             },
             squeeze: hand
                 .squeeze_action
@@ -478,7 +475,7 @@ fn main_loop<'a>(
 #[derive(Clone, Copy, Zeroable, Pod)]
 #[repr(C)]
 struct PushConstants {
-    model: [f32; 16],
+    model: [[f32; 4]; 4],
 }
 
 const NOOP_STENCIL_STATE: vk::StencilOpState = vk::StencilOpState {
