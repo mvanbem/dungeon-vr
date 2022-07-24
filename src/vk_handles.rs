@@ -169,6 +169,243 @@ impl VkHandles {
         }
     }
 
+    pub fn create_image(
+        &self,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        properties: vk::MemoryPropertyFlags,
+    ) -> (vk::Image, vk::DeviceMemory) {
+        unsafe {
+            let image = self
+                .device
+                .create_image(
+                    &vk::ImageCreateInfo::builder()
+                        .flags(vk::ImageCreateFlags::empty())
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(format)
+                        .extent(vk::Extent3D {
+                            width,
+                            height,
+                            depth: 1,
+                        })
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(usage)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                        .queue_family_indices(&[])
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    None,
+                )
+                .unwrap();
+            let requirements = self.device.get_image_memory_requirements(image);
+            let memory = self
+                .device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::builder()
+                        .allocation_size(requirements.size)
+                        .memory_type_index(
+                            self.find_memory_type(requirements.memory_type_bits, properties),
+                        ),
+                    None,
+                )
+                .unwrap();
+            self.device.bind_image_memory(image, memory, 0).unwrap();
+            (image, memory)
+        }
+    }
+
+    pub fn create_image_view(&self, image: vk::Image, format: vk::Format) -> vk::ImageView {
+        unsafe {
+            self.device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::builder()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(format)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        }),
+                    None,
+                )
+                .unwrap()
+        }
+    }
+
+    pub unsafe fn submit_commands(&self, f: impl FnOnce(vk::CommandBuffer)) {
+        let command_pool = self
+            .device
+            .create_command_pool(&vk::CommandPoolCreateInfo::builder(), None)
+            .unwrap();
+        let cmd = self
+            .device
+            .allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::builder()
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_pool(command_pool)
+                    .command_buffer_count(1),
+            )
+            .unwrap()[0];
+        self.device
+            .begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::builder()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .unwrap();
+
+        f(cmd);
+
+        self.device.end_command_buffer(cmd).unwrap();
+        self.device
+            .queue_submit(
+                self.queue,
+                &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()],
+                vk::Fence::null(),
+            )
+            .unwrap();
+        self.device.queue_wait_idle(self.queue).unwrap();
+        self.device.free_command_buffers(command_pool, &[cmd]);
+        self.device.destroy_command_pool(command_pool, None);
+    }
+
+    pub fn transition_image_layout(
+        &self,
+        image: vk::Image,
+        _format: vk::Format,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+    ) {
+        let (src_stage_mask, src_access_mask, dst_stage_mask, dst_access_mask) =
+            match (old_layout, new_layout) {
+                (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => (
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::AccessFlags::empty(),
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                ),
+                (
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                ) => (
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::AccessFlags::SHADER_READ,
+                ),
+                _ => panic!(
+                    "unsupported layout transition from {} to {}",
+                    old_layout.as_raw(),
+                    new_layout.as_raw()
+                ),
+            };
+
+        unsafe {
+            self.submit_commands(|cmd| {
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    src_stage_mask,
+                    dst_stage_mask,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[vk::ImageMemoryBarrier::builder()
+                        .old_layout(old_layout)
+                        .new_layout(new_layout)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(image)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .src_access_mask(src_access_mask)
+                        .dst_access_mask(dst_access_mask)
+                        .build()],
+                );
+            });
+        }
+    }
+
+    pub fn copy_buffer_to_image(
+        &self,
+        buffer: vk::Buffer,
+        image: vk::Image,
+        width: u32,
+        height: u32,
+    ) {
+        unsafe {
+            self.submit_commands(|cmd| {
+                self.device.cmd_copy_buffer_to_image(
+                    cmd,
+                    buffer,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::BufferImageCopy {
+                        buffer_offset: 0,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                        image_extent: vk::Extent3D {
+                            width,
+                            height,
+                            depth: 1,
+                        },
+                    }],
+                )
+            });
+        }
+    }
+
+    pub fn stage_image(
+        &self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        layout: vk::ImageLayout,
+    ) -> (vk::Image, vk::DeviceMemory) {
+        let (staging_buffer, staging_buffer_memory) =
+            self.create_initialized_buffer(&data, vk::BufferUsageFlags::TRANSFER_SRC);
+        let (image, image_memory) = self.create_image(
+            width,
+            height,
+            format,
+            usage | vk::ImageUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        );
+        self.transition_image_layout(
+            image,
+            format,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+        self.copy_buffer_to_image(staging_buffer, image, width, height);
+        unsafe {
+            self.device.destroy_buffer(staging_buffer, None);
+            self.device.free_memory(staging_buffer_memory, None);
+        }
+        self.transition_image_layout(image, format, vk::ImageLayout::TRANSFER_DST_OPTIMAL, layout);
+        (image, image_memory)
+    }
+
     pub unsafe fn destroy(self) {
         self.device.destroy_device(None);
         self.instance.destroy_instance(None);
@@ -245,6 +482,25 @@ fn create_physical_device(xr: &XrHandles, instance: &ash::Instance) -> vk::Physi
             TARGET_API_VERSION,
         );
     }
+    let features = unsafe { instance.get_physical_device_features(physical_device) };
+    assert!(features.sampler_anisotropy != 0);
+    assert!(properties.limits.max_sampler_anisotropy >= 16.0);
+    assert!(properties
+        .limits
+        .sampled_image_color_sample_counts
+        .contains(vk::SampleCountFlags::TYPE_4));
+    assert!(properties
+        .limits
+        .sampled_image_depth_sample_counts
+        .contains(vk::SampleCountFlags::TYPE_4));
+    assert!(properties
+        .limits
+        .framebuffer_color_sample_counts
+        .contains(vk::SampleCountFlags::TYPE_4));
+    assert!(properties
+        .limits
+        .framebuffer_depth_sample_counts
+        .contains(vk::SampleCountFlags::TYPE_4));
     physical_device
 }
 

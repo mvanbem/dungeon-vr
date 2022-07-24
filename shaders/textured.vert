@@ -1,7 +1,7 @@
 #version 450
 #extension GL_EXT_multiview : require
 
-layout(binding = 0) uniform Matrices {
+layout(set = 0, binding = 0) uniform Matrices {
     mat4 viewProj[2];
 } u_matrices;
 

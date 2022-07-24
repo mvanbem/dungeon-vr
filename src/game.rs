@@ -6,7 +6,9 @@ use rapier3d::na::{self, Isometry3, Matrix4, Translation, UnitQuaternion};
 use rapier3d::prelude::*;
 use slotmap::SecondaryMap;
 
-use crate::asset::{MeshAssetKey, MeshAssets};
+use crate::asset::{MaterialAssets, ModelAssetKey, ModelAssets};
+use crate::render_data::RenderData;
+use crate::vk_handles::VkHandles;
 
 #[derive(Component)]
 struct Transform(Isometry3<f32>);
@@ -18,8 +20,8 @@ impl Default for Transform {
 }
 
 #[derive(Component)]
-struct MeshRenderer {
-    mesh_key: MeshAssetKey,
+struct ModelRenderer {
+    model_key: ModelAssetKey,
 }
 
 #[derive(Component)]
@@ -62,7 +64,7 @@ pub struct VrHand {
 }
 
 #[derive(Default)]
-struct Meshes(SecondaryMap<MeshAssetKey, Vec<Matrix4<f32>>>);
+struct Models(SecondaryMap<ModelAssetKey, Vec<Matrix4<f32>>>);
 
 pub struct Game {
     world: World,
@@ -84,7 +86,12 @@ struct GamePhysics {
 }
 
 impl Game {
-    pub fn new(mesh_assets: &mut MeshAssets) -> Self {
+    pub fn new(
+        vk: &VkHandles,
+        render: &RenderData,
+        material_assets: &mut MaterialAssets,
+        model_assets: &mut ModelAssets,
+    ) -> Self {
         let mut world = World::new();
         let mut bodies = RigidBodySet::new();
         let mut colliders = ColliderSet::new();
@@ -93,8 +100,13 @@ impl Game {
             world
                 .spawn()
                 .insert(Transform::default())
-                .insert(MeshRenderer {
-                    mesh_key: mesh_assets.load(["left_hand", "right_hand"][index]),
+                .insert(ModelRenderer {
+                    model_key: model_assets.load(
+                        vk,
+                        render,
+                        material_assets,
+                        ["left_hand", "right_hand"][index],
+                    ),
                 })
                 .insert(Hand {
                     index,
@@ -105,8 +117,13 @@ impl Game {
         world
             .spawn()
             .insert(Transform(vector![0.0, 0.0, 0.0].into()))
-            .insert(MeshRenderer {
-                mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Custom_Center"),
+            .insert(ModelRenderer {
+                model_key: model_assets.load(
+                    vk,
+                    render,
+                    material_assets,
+                    "LowPolyDungeon/Dungeon_Custom_Center",
+                ),
             });
         colliders.insert(
             ColliderBuilder::cuboid(2.0, 2.0, 2.0).position(vector![0.0, -2.0, 0.0].into()),
@@ -119,8 +136,13 @@ impl Game {
                     (rot * vector![0.0, 0.0, -4.0]).into(),
                     rot,
                 )))
-                .insert(MeshRenderer {
-                    mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Custom_Border_Flat"),
+                .insert(ModelRenderer {
+                    model_key: model_assets.load(
+                        vk,
+                        render,
+                        material_assets,
+                        "LowPolyDungeon/Dungeon_Custom_Border_Flat",
+                    ),
                 });
             world
                 .spawn()
@@ -128,8 +150,13 @@ impl Game {
                     (rot * vector![0.0, 0.0, -4.0]).into(),
                     rot,
                 )))
-                .insert(MeshRenderer {
-                    mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Wall_Var1"),
+                .insert(ModelRenderer {
+                    model_key: model_assets.load(
+                        vk,
+                        render,
+                        material_assets,
+                        "LowPolyDungeon/Dungeon_Wall_Var1",
+                    ),
                 });
 
             world
@@ -138,8 +165,13 @@ impl Game {
                     (rot * vector![4.0, 0.0, 4.0]).into(),
                     rot,
                 )))
-                .insert(MeshRenderer {
-                    mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Custom_Corner_Flat"),
+                .insert(ModelRenderer {
+                    model_key: model_assets.load(
+                        vk,
+                        render,
+                        material_assets,
+                        "LowPolyDungeon/Dungeon_Custom_Corner_Flat",
+                    ),
                 });
             world
                 .spawn()
@@ -147,8 +179,13 @@ impl Game {
                     (rot * vector![-4.0, 0.0, -4.0]).into(),
                     rot,
                 )))
-                .insert(MeshRenderer {
-                    mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Wall_Var1"),
+                .insert(ModelRenderer {
+                    model_key: model_assets.load(
+                        vk,
+                        render,
+                        material_assets,
+                        "LowPolyDungeon/Dungeon_Wall_Var1",
+                    ),
                 });
             world
                 .spawn()
@@ -156,8 +193,13 @@ impl Game {
                     (rot * vector![4.0, 0.0, -4.0]).into(),
                     rot,
                 )))
-                .insert(MeshRenderer {
-                    mesh_key: mesh_assets.load("LowPolyDungeon/Dungeon_Wall_Var1"),
+                .insert(ModelRenderer {
+                    model_key: model_assets.load(
+                        vk,
+                        render,
+                        material_assets,
+                        "LowPolyDungeon/Dungeon_Wall_Var1",
+                    ),
                 });
         }
 
@@ -174,8 +216,13 @@ impl Game {
         world
             .spawn()
             .insert(Transform(vector![0.0, 1.0, 0.0].into()))
-            .insert(MeshRenderer {
-                mesh_key: mesh_assets.load("LowPolyDungeon/Key_Silver"),
+            .insert(ModelRenderer {
+                model_key: model_assets.load(
+                    vk,
+                    render,
+                    material_assets,
+                    "LowPolyDungeon/Key_Silver",
+                ),
             })
             .insert(Grabbable { grabbed: false })
             .insert(RigidBody { handle: key_body });
@@ -203,7 +250,7 @@ impl Game {
         schedule.add_stage_after(
             "post_step",
             "render",
-            SystemStage::parallel().with_system(gather_meshes),
+            SystemStage::parallel().with_system(gather_models),
         );
 
         world.insert_resource(GamePhysics {
@@ -232,8 +279,8 @@ impl Game {
     pub fn update(
         &mut self,
         vr_tracking: VrTracking,
-    ) -> SecondaryMap<MeshAssetKey, Vec<Matrix4<f32>>> {
-        self.world.insert_resource(Meshes::default());
+    ) -> SecondaryMap<ModelAssetKey, Vec<Matrix4<f32>>> {
+        self.world.insert_resource(Models::default());
         self.world.insert_resource(VrTrackingState {
             current: vr_tracking,
             prev: self.prev_vr_tracking,
@@ -242,7 +289,7 @@ impl Game {
         self.schedule.run(&mut self.world);
 
         self.prev_vr_tracking = vr_tracking;
-        self.world.remove_resource::<Meshes>().unwrap().0
+        self.world.remove_resource::<Models>().unwrap().0
     }
 }
 
@@ -369,11 +416,11 @@ fn update_rigid_body_transforms(
     }
 }
 
-fn gather_meshes(query: Query<(&Transform, &MeshRenderer)>, mut meshes: ResMut<Meshes>) {
-    for (transform, mesh_renderer) in query.iter() {
-        meshes
+fn gather_models(query: Query<(&Transform, &ModelRenderer)>, mut models: ResMut<Models>) {
+    for (transform, model_renderer) in query.iter() {
+        models
             .0
-            .entry(mesh_renderer.mesh_key)
+            .entry(model_renderer.model_key)
             .unwrap()
             .or_default()
             .push(transform.0.to_matrix());

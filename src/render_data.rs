@@ -5,9 +5,7 @@ use ash::vk;
 use rapier3d::na::Matrix4;
 
 use crate::vk_handles::VkHandles;
-use crate::{
-    flat_color, textured, PushConstants, COLOR_FORMAT, DEPTH_FORMAT, RENDER_CONCURRENCY, VIEW_COUNT,
-};
+use crate::{textured, untextured, COLOR_FORMAT, DEPTH_FORMAT, RENDER_CONCURRENCY, VIEW_COUNT};
 
 #[repr(C)]
 struct ViewProjMatrixUbo {
@@ -18,46 +16,57 @@ pub struct RenderData<'a> {
     phantom_lifetime: PhantomData<&'a VkHandles>,
 
     pub render_pass: vk::RenderPass,
-    pub descriptor_set_layout: vk::DescriptorSetLayout,
-    pub pipeline_layout: vk::PipelineLayout,
+    pub per_frame_descriptor_set_layout: vk::DescriptorSetLayout,
     pub descriptor_pool: vk::DescriptorPool,
 
     pub cmd_pool: vk::CommandPool,
     frame_resources: Vec<FrameResources>,
 
-    pub flat_color_pipeline: vk::Pipeline,
+    pub untextured_pipeline_layout: vk::PipelineLayout,
+    pub untextured_pipeline: vk::Pipeline,
+    pub textured_descriptor_set_layout: vk::DescriptorSetLayout,
+    pub textured_pipeline_layout: vk::PipelineLayout,
     pub textured_pipeline: vk::Pipeline,
 }
 
 impl<'a> RenderData<'a> {
     pub fn new(vk: &'a VkHandles) -> Self {
         let render_pass = create_render_pass(vk);
-        let descriptor_set_layout = create_descriptor_set_layout(vk);
-        let pipeline_layout = create_pipeline_layout(vk, descriptor_set_layout);
+        let per_frame_descriptor_set_layout = create_per_frame_descriptor_set_layout(vk);
         let descriptor_pool = create_descriptor_pool(vk);
 
         let cmd_pool = create_cmd_pool(vk);
         let frame_resources = (0..RENDER_CONCURRENCY)
-            .map(|_| FrameResources::new(vk, cmd_pool, descriptor_pool, descriptor_set_layout))
+            .map(|_| {
+                FrameResources::new(
+                    vk,
+                    cmd_pool,
+                    descriptor_pool,
+                    per_frame_descriptor_set_layout,
+                )
+            })
             .collect();
 
-        let flat_color_pipeline =
-            unsafe { flat_color::create_pipeline(vk, pipeline_layout, render_pass) };
-        let textured_pipeline =
-            unsafe { textured::create_pipeline(vk, pipeline_layout, render_pass) };
+        let (untextured_pipeline_layout, untextured_pipeline) = unsafe {
+            untextured::create_pipeline(vk, per_frame_descriptor_set_layout, render_pass)
+        };
+        let (textured_descriptor_set_layout, textured_pipeline_layout, textured_pipeline) =
+            unsafe { textured::create_pipeline(vk, per_frame_descriptor_set_layout, render_pass) };
 
         Self {
             phantom_lifetime: PhantomData,
 
             render_pass,
-            descriptor_set_layout,
-            pipeline_layout,
+            per_frame_descriptor_set_layout,
             descriptor_pool,
 
             cmd_pool,
             frame_resources,
 
-            flat_color_pipeline,
+            untextured_pipeline_layout,
+            untextured_pipeline,
+            textured_descriptor_set_layout,
+            textured_pipeline_layout,
             textured_pipeline,
         }
     }
@@ -76,15 +85,17 @@ impl<'a> RenderData<'a> {
     }
 
     pub unsafe fn destroy(self, device: &ash::Device) {
+        device.destroy_pipeline(self.untextured_pipeline, None);
+        device.destroy_pipeline_layout(self.untextured_pipeline_layout, None);
         device.destroy_pipeline(self.textured_pipeline, None);
-        device.destroy_pipeline(self.flat_color_pipeline, None);
+        device.destroy_pipeline_layout(self.textured_pipeline_layout, None);
+        device.destroy_descriptor_set_layout(self.textured_descriptor_set_layout, None);
         for frame_resources in self.frame_resources {
             frame_resources.destroy(device);
         }
         device.destroy_command_pool(self.cmd_pool, None);
         device.destroy_descriptor_pool(self.descriptor_pool, None);
-        device.destroy_pipeline_layout(self.pipeline_layout, None);
-        device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+        device.destroy_descriptor_set_layout(self.per_frame_descriptor_set_layout, None);
         device.destroy_render_pass(self.render_pass, None);
     }
 }
@@ -92,7 +103,7 @@ impl<'a> RenderData<'a> {
 pub struct FrameResources {
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
-    descriptor_set: vk::DescriptorSet,
+    per_frame_descriptor_set: vk::DescriptorSet,
     view_proj_matrix_buffer: vk::Buffer,
     view_proj_matrix_memory: vk::DeviceMemory,
 }
@@ -102,7 +113,7 @@ impl FrameResources {
         vk: &VkHandles,
         cmd_pool: vk::CommandPool,
         descriptor_pool: vk::DescriptorPool,
-        descriptor_set_layout: vk::DescriptorSetLayout,
+        per_frame_descriptor_set_layout: vk::DescriptorSetLayout,
     ) -> Self {
         let cmd = unsafe {
             vk.device().allocate_command_buffers(
@@ -121,11 +132,11 @@ impl FrameResources {
         }
         .unwrap();
 
-        let descriptor_set = unsafe {
+        let per_frame_descriptor_set = unsafe {
             vk.device().allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::builder()
                     .descriptor_pool(descriptor_pool)
-                    .set_layouts(&[descriptor_set_layout]),
+                    .set_layouts(&[per_frame_descriptor_set_layout]),
             )
         }
         .unwrap()[0];
@@ -166,7 +177,7 @@ impl FrameResources {
         unsafe {
             vk.device().update_descriptor_sets(
                 &[vk::WriteDescriptorSet::builder()
-                    .dst_set(descriptor_set)
+                    .dst_set(per_frame_descriptor_set)
                     .dst_binding(0)
                     .dst_array_element(0)
                     .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
@@ -183,7 +194,7 @@ impl FrameResources {
         Self {
             cmd,
             fence,
-            descriptor_set,
+            per_frame_descriptor_set,
             view_proj_matrix_buffer,
             view_proj_matrix_memory,
         }
@@ -197,8 +208,8 @@ impl FrameResources {
         self.fence
     }
 
-    pub fn descriptor_set(&self) -> vk::DescriptorSet {
-        self.descriptor_set
+    pub fn per_frame_descriptor_set(&self) -> vk::DescriptorSet {
+        self.per_frame_descriptor_set
     }
 
     pub fn write_view_proj_matrix(
@@ -292,7 +303,7 @@ fn create_render_pass(vk: &VkHandles) -> vk::RenderPass {
     .unwrap()
 }
 
-fn create_descriptor_set_layout(vk: &VkHandles) -> vk::DescriptorSetLayout {
+fn create_per_frame_descriptor_set_layout(vk: &VkHandles) -> vk::DescriptorSetLayout {
     unsafe {
         vk.device().create_descriptor_set_layout(
             &vk::DescriptorSetLayoutCreateInfo::builder().bindings(&[
@@ -302,26 +313,13 @@ fn create_descriptor_set_layout(vk: &VkHandles) -> vk::DescriptorSetLayout {
                     .descriptor_count(1)
                     .stage_flags(vk::ShaderStageFlags::VERTEX)
                     .build(),
+                vk::DescriptorSetLayoutBinding::builder()
+                    .binding(1)
+                    .descriptor_count(1)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                    .build(),
             ]),
-            None,
-        )
-    }
-    .unwrap()
-}
-
-fn create_pipeline_layout(
-    vk: &VkHandles,
-    descriptor_set_layout: vk::DescriptorSetLayout,
-) -> vk::PipelineLayout {
-    unsafe {
-        vk.device().create_pipeline_layout(
-            &vk::PipelineLayoutCreateInfo::builder()
-                .set_layouts(&[descriptor_set_layout])
-                .push_constant_ranges(&[vk::PushConstantRange {
-                    stage_flags: vk::ShaderStageFlags::VERTEX,
-                    offset: 0,
-                    size: size_of::<PushConstants>() as u32,
-                }]),
             None,
         )
     }
@@ -332,10 +330,20 @@ fn create_descriptor_pool(vk: &VkHandles) -> vk::DescriptorPool {
     unsafe {
         vk.device().create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo::builder()
-                .pool_sizes(&[vk::DescriptorPoolSize::builder()
-                    .descriptor_count(RENDER_CONCURRENCY)
-                    .build()])
-                .max_sets(RENDER_CONCURRENCY),
+                .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND)
+                .pool_sizes(&[
+                    vk::DescriptorPoolSize::builder()
+                        .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                        .descriptor_count(RENDER_CONCURRENCY)
+                        .build(),
+                    // TODO: This is a scaling limitation for the number of concurrently loaded
+                    // materials.
+                    vk::DescriptorPoolSize::builder()
+                        .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(100)
+                        .build(),
+                ])
+                .max_sets(RENDER_CONCURRENCY + 100),
             None,
         )
     }

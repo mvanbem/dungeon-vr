@@ -5,18 +5,32 @@ use ash::util::read_spv;
 use ash::vk;
 use memoffset::offset_of;
 
-use crate::mesh::FlatColorVertex;
+use crate::model::TexturedVertex;
 use crate::vk_handles::VkHandles;
-use crate::NOOP_STENCIL_STATE;
+use crate::{PushConstants, NOOP_STENCIL_STATE};
 
-const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/flat_color.vert.spv"));
-const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/flat_color.frag.spv"));
+const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/untextured.vert.spv"));
+const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/untextured.frag.spv"));
 
 pub unsafe fn create_pipeline(
     vk: &VkHandles,
-    pipeline_layout: vk::PipelineLayout,
+    per_frame_descriptor_set_layout: vk::DescriptorSetLayout,
     render_pass: vk::RenderPass,
-) -> vk::Pipeline {
+) -> (vk::PipelineLayout, vk::Pipeline) {
+    let pipeline_layout = vk
+        .device()
+        .create_pipeline_layout(
+            &vk::PipelineLayoutCreateInfo::builder()
+                .set_layouts(&[per_frame_descriptor_set_layout])
+                .push_constant_ranges(&[vk::PushConstantRange {
+                    stage_flags: vk::ShaderStageFlags::VERTEX,
+                    offset: 0,
+                    size: size_of::<PushConstants>() as u32,
+                }]),
+            None,
+        )
+        .unwrap();
+
     let vert = read_spv(&mut Cursor::new(VERT_SPV)).unwrap();
     let frag = read_spv(&mut Cursor::new(FRAG_SPV)).unwrap();
     let vert = vk
@@ -52,7 +66,7 @@ pub unsafe fn create_pipeline(
                         .vertex_binding_descriptions(&[vk::VertexInputBindingDescription::builder(
                         )
                         .binding(0)
-                        .stride(size_of::<FlatColorVertex>() as u32)
+                        .stride(size_of::<TexturedVertex>() as u32)
                         .input_rate(vk::VertexInputRate::VERTEX)
                         .build()])
                         .vertex_attribute_descriptions(&[
@@ -60,13 +74,19 @@ pub unsafe fn create_pipeline(
                                 .location(0)
                                 .binding(0)
                                 .format(vk::Format::R32G32B32_SFLOAT)
-                                .offset(offset_of!(FlatColorVertex, position) as u32)
+                                .offset(offset_of!(TexturedVertex, position) as u32)
                                 .build(),
                             vk::VertexInputAttributeDescription::builder()
                                 .location(1)
                                 .binding(0)
                                 .format(vk::Format::R32G32B32_SFLOAT)
-                                .offset(offset_of!(FlatColorVertex, color) as u32)
+                                .offset(offset_of!(TexturedVertex, normal) as u32)
+                                .build(),
+                            vk::VertexInputAttributeDescription::builder()
+                                .location(2)
+                                .binding(0)
+                                .format(vk::Format::R32G32_SFLOAT)
+                                .offset(offset_of!(TexturedVertex, texcoord) as u32)
                                 .build(),
                         ]),
                 )
@@ -127,5 +147,5 @@ pub unsafe fn create_pipeline(
     vk.device().destroy_shader_module(vert, None);
     vk.device().destroy_shader_module(frag, None);
 
-    pipeline
+    (pipeline_layout, pipeline)
 }

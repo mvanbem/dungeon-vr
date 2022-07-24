@@ -6,8 +6,8 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Result};
 
 const GLSL_SOURCES: &[&str] = &[
-    "flat_color.vert",
-    "flat_color.frag",
+    "untextured.vert",
+    "untextured.frag",
     "textured.vert",
     "textured.frag",
 ];

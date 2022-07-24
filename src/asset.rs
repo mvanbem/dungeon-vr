@@ -1,59 +1,104 @@
+use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::fmt::Debug;
+use std::hash::Hash;
 
+use anyhow::Result;
 use slotmap::{new_key_type, SlotMap};
 
-use crate::mesh::Mesh;
+use crate::material::Material;
+use crate::model::Model;
+use crate::render_data::RenderData;
 use crate::vk_handles::VkHandles;
 
-new_key_type! { pub struct MeshAssetKey; }
+new_key_type! { pub struct MaterialAssetKey; }
+pub type MaterialAssets = Assets<Material, MaterialAssetKey>;
 
-pub struct MeshAssets<'a> {
-    vk: &'a VkHandles,
-    meshes: SlotMap<MeshAssetKey, Mesh>,
-    mesh_keys_by_name: HashMap<String, MeshAssetKey>,
-    placeholder_key: MeshAssetKey,
+new_key_type! { pub struct ModelAssetKey; }
+pub type ModelAssets = Assets<Model, ModelAssetKey>;
+
+pub trait Asset {
+    unsafe fn destroy(self, vk: &VkHandles, render: &RenderData);
 }
 
-impl<'a> MeshAssets<'a> {
-    pub fn new(vk: &'a VkHandles) -> Self {
-        let mut meshes = SlotMap::with_key();
-        let mut mesh_keys_by_name = HashMap::new();
+pub trait Loader {
+    type Asset: Asset;
+    type ID: Borrow<Self::BorrowedID>;
+    type BorrowedID: ?Sized + ToOwned<Owned = Self::ID>;
+    type Context;
 
-        let placeholder_key = meshes.insert(crate::mesh::create_debug_mesh(vk));
-        mesh_keys_by_name.insert(String::new(), placeholder_key);
+    fn load_placeholder(
+        vk: &VkHandles,
+        render: &RenderData,
+        ctx: &mut Self::Context,
+    ) -> Option<Self::Asset>;
+
+    fn load(
+        vk: &VkHandles,
+        render: &RenderData,
+        ctx: &mut Self::Context,
+        id: &Self::BorrowedID,
+    ) -> Result<Self::Asset>;
+}
+
+pub struct Assets<L: Loader, K: slotmap::Key> {
+    assets: SlotMap<K, L::Asset>,
+    keys_by_id: HashMap<L::ID, K>,
+    placeholder_key: K,
+}
+
+impl<L: Loader, K: slotmap::Key> Assets<L, K> {
+    pub fn new(vk: &VkHandles, render: &RenderData, ctx: &mut L::Context) -> Self {
+        let mut assets = SlotMap::with_key();
+        let placeholder_key = match L::load_placeholder(vk, render, ctx) {
+            Some(asset) => assets.insert(asset),
+            None => K::null(),
+        };
 
         Self {
-            vk,
-            meshes,
-            mesh_keys_by_name,
+            assets,
+            keys_by_id: HashMap::new(),
             placeholder_key,
         }
     }
 
-    pub fn load(&mut self, name: &str) -> MeshAssetKey {
-        if let Some(mesh) = self.mesh_keys_by_name.get(name) {
-            return *mesh;
+    pub fn load(
+        &mut self,
+        vk: &VkHandles,
+        render: &RenderData,
+        ctx: &mut L::Context,
+        id: &L::BorrowedID,
+    ) -> K
+    where
+        L::ID: Eq + Hash,
+        L::BorrowedID: Debug + Eq + Hash,
+    {
+        if let Some(asset) = self.keys_by_id.get(id) {
+            return *asset;
         }
 
-        let path = format!("assets/{name}.glb");
-        let mesh_key = match Mesh::load(self.vk, &path) {
-            Ok(mesh) => self.meshes.insert(mesh),
+        let key = match L::load(vk, render, ctx, id) {
+            Ok(asset) => self.assets.insert(asset),
             Err(e) => {
-                eprintln!("Error loading mesh {}: {}", path, e);
-                self.placeholder_key
+                if self.placeholder_key.is_null() {
+                    panic!("Error loading asset {:?}: {}", id, e);
+                } else {
+                    eprintln!("Error loading asset {:?}: {}", id, e);
+                    self.placeholder_key
+                }
             }
         };
-        self.mesh_keys_by_name.insert(name.to_string(), mesh_key);
-        mesh_key
+        self.keys_by_id.insert(id.to_owned(), key);
+        key
     }
 
-    pub fn get(&self, key: MeshAssetKey) -> &Mesh {
-        &self.meshes[key]
+    pub fn get(&self, key: K) -> &L::Asset {
+        &self.assets[key]
     }
 
-    pub unsafe fn destroy(mut self) {
-        for (_, mesh) in self.meshes.drain() {
-            mesh.destroy(self.vk.device());
+    pub unsafe fn destroy(mut self, vk: &VkHandles, render: &RenderData) {
+        for (_, asset) in self.assets.drain() {
+            asset.destroy(vk, render);
         }
     }
 }

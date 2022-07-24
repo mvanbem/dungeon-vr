@@ -5,18 +5,47 @@ use ash::util::read_spv;
 use ash::vk;
 use memoffset::offset_of;
 
-use crate::mesh::TexturedVertex;
+use crate::model::TexturedVertex;
 use crate::vk_handles::VkHandles;
-use crate::NOOP_STENCIL_STATE;
+use crate::{PushConstants, NOOP_STENCIL_STATE};
 
 const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/textured.vert.spv"));
 const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/textured.frag.spv"));
 
 pub unsafe fn create_pipeline(
     vk: &VkHandles,
-    pipeline_layout: vk::PipelineLayout,
+    per_frame_descriptor_set_layout: vk::DescriptorSetLayout,
     render_pass: vk::RenderPass,
-) -> vk::Pipeline {
+) -> (vk::DescriptorSetLayout, vk::PipelineLayout, vk::Pipeline) {
+    let descriptor_set_layout = vk
+        .device()
+        .create_descriptor_set_layout(
+            &vk::DescriptorSetLayoutCreateInfo::builder().bindings(&[
+                vk::DescriptorSetLayoutBinding::builder()
+                    .binding(0)
+                    .descriptor_count(1)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                    .build(),
+            ]),
+            None,
+        )
+        .unwrap();
+
+    let pipeline_layout = vk
+        .device()
+        .create_pipeline_layout(
+            &vk::PipelineLayoutCreateInfo::builder()
+                .set_layouts(&[per_frame_descriptor_set_layout, descriptor_set_layout])
+                .push_constant_ranges(&[vk::PushConstantRange {
+                    stage_flags: vk::ShaderStageFlags::VERTEX,
+                    offset: 0,
+                    size: size_of::<PushConstants>() as u32,
+                }]),
+            None,
+        )
+        .unwrap();
+
     let vert = read_spv(&mut Cursor::new(VERT_SPV)).unwrap();
     let frag = read_spv(&mut Cursor::new(FRAG_SPV)).unwrap();
     let vert = vk
@@ -133,5 +162,5 @@ pub unsafe fn create_pipeline(
     vk.device().destroy_shader_module(vert, None);
     vk.device().destroy_shader_module(frag, None);
 
-    pipeline
+    (descriptor_set_layout, pipeline_layout, pipeline)
 }

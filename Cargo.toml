@@ -13,11 +13,11 @@ bevy_ecs = "0.7"
 bytemuck = { version = "1", features = ["derive"] }
 cstr = "0.2"
 ctrlc = "3"
-enum-map = "2"
 gltf = { version = "1", features = ["utils"] }
 memoffset = "0.6"
 openxr = { version = "0.16", features = ["static"] }
 ordered-float = "3"
+png = "0.17"
 rapier3d = { version = "0.14", features = ["simd-stable"] }
 slotmap = "1"
 

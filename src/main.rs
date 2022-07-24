@@ -1,18 +1,20 @@
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use enum_map::Enum;
 use openxr as xr;
 use rapier3d::na::{self as nalgebra};
 use rapier3d::na::{self, matrix, vector, Matrix4};
-use slotmap::SecondaryMap;
+use slotmap::Key;
 
-use crate::asset::{MeshAssetKey, MeshAssets};
+use crate::asset::{MaterialAssetKey, MaterialAssets, ModelAssets};
 use crate::game::{Game, VrHand, VrTracking};
 use crate::interop::xr_posef_to_na_isometry;
+use crate::model::Primitive;
 use crate::render_data::RenderData;
 use crate::swapchain::Swapchain;
 use crate::vk_handles::VkHandles;
@@ -20,13 +22,14 @@ use crate::xr_handles::XrHandles;
 use crate::xr_session::{XrSession, XrSessionHand};
 
 mod asset;
-mod flat_color;
 mod game;
 mod interop;
-mod mesh;
+mod material;
+mod model;
 mod render_data;
 mod swapchain;
 mod textured;
+mod untextured;
 mod vk_handles;
 mod xr_handles;
 mod xr_session;
@@ -46,8 +49,9 @@ pub fn main() {
     let vk = VkHandles::new(&xr);
     let mut xrs = XrSession::new(&xr, &vk);
     let render = RenderData::new(&vk);
-    let mut mesh_assets = MeshAssets::new(&vk);
-    let mut game = Game::new(&mut mesh_assets);
+    let mut material_assets = MaterialAssets::new(&vk, &render, &mut ());
+    let mut model_assets = ModelAssets::new(&vk, &render, &mut material_assets);
+    let mut game = Game::new(&vk, &render, &mut material_assets, &mut model_assets);
 
     let mut swapchain = None;
     main_loop(
@@ -57,14 +61,16 @@ pub fn main() {
         &mut xrs,
         &render,
         &mut swapchain,
-        &mut mesh_assets,
+        &mut material_assets,
+        &mut model_assets,
         &mut game,
     );
 
     drop(xrs);
     render.wait_for_fences(&vk);
     unsafe {
-        mesh_assets.destroy();
+        model_assets.destroy(&vk, &render);
+        material_assets.destroy(&vk, &render);
         render.destroy(vk.device());
         if let Some(swapchain) = swapchain {
             swapchain.destroy(vk.device());
@@ -122,7 +128,8 @@ fn main_loop<'a>(
     xrs: &mut XrSession,
     render: &RenderData,
     swapchain: &mut Option<Swapchain<'a>>,
-    mesh_assets: &mut MeshAssets,
+    material_assets: &mut MaterialAssets,
+    model_assets: &mut ModelAssets,
     game: &mut Game,
 ) {
     let mut event_storage = xr::EventDataBuffer::new();
@@ -277,6 +284,24 @@ fn main_loop<'a>(
                 build_projection_matrix(views[1].fov) * build_view_matrix(views[1]),
             ],
         );
+        unsafe {
+            vk.device().cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                render.untextured_pipeline_layout,
+                0,
+                &[frame_resources.per_frame_descriptor_set()],
+                &[],
+            );
+            vk.device().cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                render.textured_pipeline_layout,
+                0,
+                &[frame_resources.per_frame_descriptor_set()],
+                &[],
+            );
+        }
 
         // Read inputs.
         xrs.session
@@ -314,49 +339,56 @@ fn main_loop<'a>(
         };
 
         // Step the game and extract rendering data.
-        let meshes = game.update(vr_tracking);
+        let models = game.update(vr_tracking);
 
-        // Group mesh instances.
-        let mut sorted_meshes: SecondaryMap<MeshAssetKey, Vec<Matrix4<f32>>> = Default::default();
-        for (mesh_key, transforms) in meshes {
-            sorted_meshes
-                .entry(mesh_key)
-                .unwrap()
-                .or_default()
-                .extend(transforms);
+        // Group primitive instances.
+        let mut transforms_by_primitive_by_material: HashMap<
+            MaterialAssetKey,
+            HashMap<RefEq<Primitive>, Vec<Matrix4<f32>>>,
+        > = Default::default();
+        for (model_key, transforms) in models {
+            let model = model_assets.get(model_key);
+            for primitive in &model.primitives {
+                transforms_by_primitive_by_material
+                    .entry(primitive.material)
+                    .or_default()
+                    .entry(RefEq(primitive))
+                    .or_default()
+                    .extend(transforms.clone());
+            }
         }
 
-        // Draw all meshes.
-        unsafe {
-            vk.device().cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                render.pipeline_layout,
-                0,
-                &[frame_resources.descriptor_set()],
-                &[],
-            );
-        }
-        for (mesh_key, transforms) in sorted_meshes {
-            let mesh = mesh_assets.get(mesh_key);
-            for primitive in &mesh.primitives {
-                match primitive.vertex_format {
-                    VertexFormat::FlatColor => unsafe {
-                        vk.device().cmd_bind_pipeline(
-                            cmd,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            render.flat_color_pipeline,
-                        );
-                    },
-                    VertexFormat::Textured => unsafe {
-                        vk.device().cmd_bind_pipeline(
-                            cmd,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            render.textured_pipeline,
-                        );
-                    },
+        // Draw all primitives.
+        for (material_key, transforms_by_primitive) in transforms_by_primitive_by_material {
+            let pipeline_layout = if material_key.is_null() {
+                unsafe {
+                    vk.device().cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        render.untextured_pipeline,
+                    );
                 }
+                render.untextured_pipeline_layout
+            } else {
+                unsafe {
+                    vk.device().cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        render.textured_pipeline,
+                    );
+                    vk.device().cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        render.textured_pipeline_layout,
+                        1,
+                        &[material_assets.get(material_key).descriptor_set],
+                        &[],
+                    );
+                }
+                render.textured_pipeline_layout
+            };
 
+            for (RefEq(primitive), transforms) in transforms_by_primitive {
                 unsafe {
                     vk.device()
                         .cmd_bind_vertex_buffers(cmd, 0, &[primitive.vertex_buffer], &[0]);
@@ -371,7 +403,7 @@ fn main_loop<'a>(
                     unsafe {
                         vk.device().cmd_push_constants(
                             cmd,
-                            render.pipeline_layout,
+                            pipeline_layout,
                             vk::ShaderStageFlags::VERTEX,
                             0,
                             bytemuck::bytes_of(&PushConstants {
@@ -488,8 +520,19 @@ const NOOP_STENCIL_STATE: vk::StencilOpState = vk::StencilOpState {
     reference: 0,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Enum)]
-pub enum VertexFormat {
-    FlatColor,
-    Textured,
+#[derive(Clone, Copy)]
+struct RefEq<'a, T>(&'a T);
+
+impl<'a, T> PartialEq for RefEq<'a, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 as *const T == other.0 as *const T
+    }
+}
+
+impl<'a, T> Eq for RefEq<'a, T> {}
+
+impl<'a, T> Hash for RefEq<'a, T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (self.0 as *const T).hash(state);
+    }
 }
