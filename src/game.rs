@@ -7,6 +7,7 @@ use rapier3d::prelude::*;
 use slotmap::SecondaryMap;
 
 use crate::asset::{MaterialAssets, ModelAssetKey, ModelAssets};
+use crate::collider_cache::{BorrowedColliderCacheKey, ColliderCache};
 use crate::render_data::RenderData;
 use crate::vk_handles::VkHandles;
 
@@ -95,6 +96,7 @@ impl Game {
         let mut world = World::new();
         let mut bodies = RigidBodySet::new();
         let mut colliders = ColliderSet::new();
+        let mut collider_cache = ColliderCache::new();
 
         for index in 0..2 {
             world
@@ -209,7 +211,9 @@ impl Game {
                 .build(),
         );
         colliders.insert_with_parent(
-            ColliderBuilder::cuboid(0.05, 0.05, 0.05),
+            collider_cache.get(BorrowedColliderCacheKey::ConvexHull(
+                "LowPolyDungeon/Key_Silver",
+            )),
             key_body,
             &mut bodies,
         );

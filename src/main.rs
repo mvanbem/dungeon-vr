@@ -22,6 +22,7 @@ use crate::xr_handles::XrHandles;
 use crate::xr_session::{XrSession, XrSessionHand};
 
 mod asset;
+mod collider_cache;
 mod game;
 mod interop;
 mod material;
