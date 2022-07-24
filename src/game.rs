@@ -116,98 +116,48 @@ impl Game {
                 });
         }
 
-        world
-            .spawn()
-            .insert(Transform(vector![0.0, 0.0, 0.0].into()))
-            .insert(ModelRenderer {
-                model_key: model_assets.load(
-                    vk,
-                    render,
-                    material_assets,
-                    "LowPolyDungeon/Dungeon_Custom_Center",
-                ),
-            });
-        colliders.insert(
-            ColliderBuilder::cuboid(2.0, 2.0, 2.0).position(vector![0.0, -2.0, 0.0].into()),
+        let mut spawn_context = SpawnContext {
+            vk,
+            render,
+            material_assets,
+            model_assets,
+            world: &mut world,
+            colliders: &mut colliders,
+            collider_cache: &mut collider_cache,
+        };
+        spawn_context.spawn_static_model(
+            "LowPolyDungeon/Dungeon_Custom_Center",
+            vector![0.0, 0.0, 0.0].into(),
         );
         for side in 0..4 {
             let rot = UnitQuaternion::from_scaled_axis(vector![0.0, FRAC_PI_2, 0.0] * side as f32);
-            world
-                .spawn()
-                .insert(Transform(Isometry3::from_parts(
-                    (rot * vector![0.0, 0.0, -4.0]).into(),
-                    rot,
-                )))
-                .insert(ModelRenderer {
-                    model_key: model_assets.load(
-                        vk,
-                        render,
-                        material_assets,
-                        "LowPolyDungeon/Dungeon_Custom_Border_Flat",
-                    ),
-                });
-            world
-                .spawn()
-                .insert(Transform(Isometry3::from_parts(
-                    (rot * vector![0.0, 0.0, -4.0]).into(),
-                    rot,
-                )))
-                .insert(ModelRenderer {
-                    model_key: model_assets.load(
-                        vk,
-                        render,
-                        material_assets,
-                        "LowPolyDungeon/Dungeon_Wall_Var1",
-                    ),
-                });
+            spawn_context.spawn_static_model(
+                "LowPolyDungeon/Dungeon_Custom_Border_Flat",
+                Isometry3::from_parts((rot * vector![0.0, 0.0, -4.0]).into(), rot),
+            );
+            spawn_context.spawn_static_model(
+                "LowPolyDungeon/Dungeon_Wall_Var1",
+                Isometry3::from_parts((rot * vector![0.0, 0.0, -4.0]).into(), rot),
+            );
 
-            world
-                .spawn()
-                .insert(Transform(Isometry3::from_parts(
-                    (rot * vector![4.0, 0.0, 4.0]).into(),
-                    rot,
-                )))
-                .insert(ModelRenderer {
-                    model_key: model_assets.load(
-                        vk,
-                        render,
-                        material_assets,
-                        "LowPolyDungeon/Dungeon_Custom_Corner_Flat",
-                    ),
-                });
-            world
-                .spawn()
-                .insert(Transform(Isometry3::from_parts(
-                    (rot * vector![-4.0, 0.0, -4.0]).into(),
-                    rot,
-                )))
-                .insert(ModelRenderer {
-                    model_key: model_assets.load(
-                        vk,
-                        render,
-                        material_assets,
-                        "LowPolyDungeon/Dungeon_Wall_Var1",
-                    ),
-                });
-            world
-                .spawn()
-                .insert(Transform(Isometry3::from_parts(
-                    (rot * vector![4.0, 0.0, -4.0]).into(),
-                    rot,
-                )))
-                .insert(ModelRenderer {
-                    model_key: model_assets.load(
-                        vk,
-                        render,
-                        material_assets,
-                        "LowPolyDungeon/Dungeon_Wall_Var1",
-                    ),
-                });
+            spawn_context.spawn_static_model(
+                "LowPolyDungeon/Dungeon_Custom_Corner_Flat",
+                Isometry3::from_parts((rot * vector![4.0, 0.0, 4.0]).into(), rot),
+            );
+            spawn_context.spawn_static_model(
+                "LowPolyDungeon/Dungeon_Wall_Var1",
+                Isometry3::from_parts((rot * vector![-4.0, 0.0, -4.0]).into(), rot),
+            );
+            spawn_context.spawn_static_model(
+                "LowPolyDungeon/Dungeon_Wall_Var1",
+                Isometry3::from_parts((rot * vector![4.0, 0.0, -4.0]).into(), rot),
+            );
         }
 
         let key_body = bodies.insert(
             RigidBodyBuilder::dynamic()
                 .translation(vector![0.0, 1.0, 0.0])
+                .ccd_enabled(true)
                 .build(),
         );
         colliders.insert_with_parent(
@@ -294,6 +244,36 @@ impl Game {
 
         self.prev_vr_tracking = vr_tracking;
         self.world.remove_resource::<Models>().unwrap().0
+    }
+}
+
+struct SpawnContext<'a> {
+    vk: &'a VkHandles,
+    render: &'a RenderData<'a>,
+    material_assets: &'a mut MaterialAssets,
+    model_assets: &'a mut ModelAssets,
+    world: &'a mut World,
+    colliders: &'a mut ColliderSet,
+    collider_cache: &'a mut ColliderCache,
+}
+
+impl<'a> SpawnContext<'a> {
+    fn spawn_static_model(&mut self, name: &str, transform: Isometry3<f32>) {
+        self.world
+            .spawn()
+            .insert(Transform(transform))
+            .insert(ModelRenderer {
+                model_key: self
+                    .model_assets
+                    .load(self.vk, self.render, self.material_assets, name),
+            });
+        self.colliders.insert(
+            self.collider_cache
+                .get(BorrowedColliderCacheKey::TriangleMesh(&format!(
+                    "{name}_col"
+                )))
+                .position(transform),
+        );
     }
 }
 
