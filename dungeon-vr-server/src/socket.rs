@@ -1,0 +1,40 @@
+use std::fmt::{Debug, Display};
+use std::future::Future;
+use std::hash::Hash;
+use std::io;
+use std::net::SocketAddr;
+
+use futures::TryFutureExt;
+use tokio::net::UdpSocket;
+
+#[cfg(test)]
+pub mod testing;
+
+pub trait BoundSocket {
+    type Addr: Debug + Display + Copy + Eq + Hash + Send + Sync + 'static;
+
+    type RecvFrom<'a>: Future<Output = io::Result<(usize, Self::Addr)>> + Send
+    where
+        Self: 'a;
+
+    type SendTo<'a>: Future<Output = io::Result<()>> + Send
+    where
+        Self: 'a;
+
+    fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> Self::RecvFrom<'a>;
+    fn send_to<'a>(&'a self, buf: &'a [u8], addr: Self::Addr) -> Self::SendTo<'a>;
+}
+
+impl BoundSocket for UdpSocket {
+    type Addr = SocketAddr;
+    type RecvFrom<'a> = impl Future<Output = io::Result<(usize, SocketAddr)>> + 'a;
+    type SendTo<'a> = impl Future<Output = io::Result<()>> + 'a;
+
+    fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> Self::RecvFrom<'a> {
+        self.recv_from(buf)
+    }
+
+    fn send_to<'a>(&'a self, buf: &'a [u8], addr: SocketAddr) -> Self::SendTo<'a> {
+        self.send_to(buf, addr).map_ok(|_| ())
+    }
+}

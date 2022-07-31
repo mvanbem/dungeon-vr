@@ -1,0 +1,31 @@
+[package]
+name = "dungeon-vr"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1"
+ash = { version = "0.37", default-features = false, features = ["loaded"] }
+bevy_ecs = "0.7"
+bytemuck = { version = "1", features = ["derive"] }
+byteorder = "1"
+clap = { version = "3", features = ["derive"] }
+cstr = "0.2"
+ctrlc = "3"
+dungeon-vr-client = { path = "../dungeon-vr-client" }
+env_logger = "0.9"
+gltf = { version = "1", features = ["utils"] }
+log = "0.4"
+memoffset = "0.6"
+openxr = { version = "0.16", features = ["static"] }
+ordered-float = "3"
+png = "0.17"
+rapier3d = { version = "0.14", features = ["simd-stable"] }
+slotmap = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[build-dependencies]
+anyhow = "1"

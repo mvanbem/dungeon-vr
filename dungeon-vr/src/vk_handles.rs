@@ -6,6 +6,7 @@ use ash::vk::{self, Handle};
 use openxr as xr;
 
 use crate::xr_handles::XrHandles;
+use crate::Args;
 
 const TARGET_VK_MAJOR_VERSION: u16 = 1;
 const TARGET_VK_MINOR_VERSION: u16 = 1;
@@ -15,7 +16,6 @@ const TARGET_API_VERSION: VkVersion = VkVersion(vk::make_api_version(
     TARGET_VK_MINOR_VERSION as u32,
     0,
 ));
-const ENABLE_VK_VALIDATION_LAYER: bool = false;
 
 struct VkVersion(u32);
 
@@ -66,10 +66,10 @@ pub struct VkHandles {
 }
 
 impl VkHandles {
-    pub fn new(xr: &XrHandles) -> Self {
+    pub fn new(args: &Args, xr: &XrHandles) -> Self {
         verify_version(xr);
         let entry = unsafe { ash::Entry::load() }.unwrap();
-        let instance = create_instance(xr, &entry);
+        let instance = create_instance(args, xr, &entry);
         let physical_device = create_physical_device(xr, &instance);
         let queue_family_index = get_queue_family_index(&instance, physical_device);
         let device = create_device(xr, &entry, &instance, physical_device, queue_family_index);
@@ -430,7 +430,7 @@ fn verify_version(xr: &XrHandles) {
     }
 }
 
-fn create_instance(xr: &XrHandles, entry: &ash::Entry) -> ash::Instance {
+fn create_instance(args: &Args, xr: &XrHandles, entry: &ash::Entry) -> ash::Instance {
     let app_info = vk::ApplicationInfo::builder()
         .application_version(0)
         .engine_version(0)
@@ -438,7 +438,7 @@ fn create_instance(xr: &XrHandles, entry: &ash::Entry) -> ash::Instance {
     let mut instance_create_info = vk::InstanceCreateInfo::builder()
         .application_info(&app_info)
         .enabled_extension_names(&[b"VK_EXT_debug_utils\0" as *const u8 as *const i8]);
-    if ENABLE_VK_VALIDATION_LAYER {
+    if args.vulkan_validation {
         instance_create_info = instance_create_info
             .enabled_layer_names(&[b"VK_LAYER_KHRONOS_validation\0" as *const u8 as *const i8]);
     }

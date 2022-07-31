@@ -1,19 +1,24 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Result;
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
+use clap::Parser;
+use dungeon_vr_client::Client;
 use openxr as xr;
-use rapier3d::na::{self as nalgebra};
+use rapier3d::na as nalgebra;
 use rapier3d::na::{self, matrix, vector, Matrix4};
 use slotmap::Key;
 
 use crate::asset::{MaterialAssetKey, MaterialAssets, ModelAssets};
-use crate::game::{Game, VrHand, VrTracking};
 use crate::interop::xr_posef_to_na_isometry;
+use crate::local_game::{LocalGame, VrHand, VrTracking};
 use crate::model::Primitive;
 use crate::render_data::RenderData;
 use crate::swapchain::Swapchain;
@@ -23,8 +28,8 @@ use crate::xr_session::{XrSession, XrSessionHand};
 
 mod asset;
 mod collider_cache;
-mod game;
 mod interop;
+mod local_game;
 mod material;
 mod model;
 mod render_data;
@@ -36,26 +41,56 @@ mod xr_handles;
 mod xr_session;
 
 const RENDER_CONCURRENCY: u32 = 2;
-const ABORT_AFTER_FIRST_FRAME: bool = false;
 
 const COLOR_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 const VIEW_COUNT: u32 = 2;
 const VIEW_TYPE: xr::ViewConfigurationType = xr::ViewConfigurationType::PRIMARY_STEREO;
 
-pub fn main() {
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+pub struct Args {
+    /// Exits after one trip through the main loop.
+    #[clap(long)]
+    abort_after_first_frame: bool,
+
+    /// Enable the Vulkan validation layer.
+    #[clap(long)]
+    vulkan_validation: bool,
+
+    /// Connects to a remote server at this address. Port 7777 if unspecified.
+    #[clap(long)]
+    connect: Option<String>,
+}
+
+#[tokio::main]
+pub async fn main() -> Result<()> {
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Debug)
+        .format_target(false)
+        .init();
+    let args = Args::parse();
+    if let Some(host) = &args.connect {
+        let client = Client::spawn(SocketAddr::from_str(host).unwrap())
+            .await
+            .unwrap();
+        // TODO
+        Box::leak(Box::new(client));
+    }
+
     let running = set_ctrlc_handler();
 
     let xr = XrHandles::new();
-    let vk = VkHandles::new(&xr);
+    let vk = VkHandles::new(&args, &xr);
     let mut xrs = XrSession::new(&xr, &vk);
     let render = RenderData::new(&vk);
     let mut material_assets = MaterialAssets::new(&vk, &render, &mut ());
     let mut model_assets = ModelAssets::new(&vk, &render, &mut material_assets);
-    let mut game = Game::new(&vk, &render, &mut material_assets, &mut model_assets);
+    let mut game = LocalGame::new(&vk, &render, &mut material_assets, &mut model_assets);
 
     let mut swapchain = None;
     main_loop(
+        &args,
         running,
         &vk,
         &xr,
@@ -78,6 +113,7 @@ pub fn main() {
         }
         vk.destroy();
     }
+    Ok(())
 }
 
 fn set_ctrlc_handler() -> Arc<AtomicBool> {
@@ -123,6 +159,7 @@ fn frustum(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) ->
 }
 
 fn main_loop<'a>(
+    args: &Args,
     running: Arc<AtomicBool>,
     vk: &'a VkHandles,
     xr: &XrHandles,
@@ -131,7 +168,7 @@ fn main_loop<'a>(
     swapchain: &mut Option<Swapchain<'a>>,
     material_assets: &mut MaterialAssets,
     model_assets: &mut ModelAssets,
-    game: &mut Game,
+    game: &mut LocalGame,
 ) {
     let mut event_storage = xr::EventDataBuffer::new();
     let mut session_running = false;
@@ -497,7 +534,7 @@ fn main_loop<'a>(
             )
             .unwrap();
 
-        if ABORT_AFTER_FIRST_FRAME {
+        if args.abort_after_first_frame {
             panic!("end of first frame");
         }
 

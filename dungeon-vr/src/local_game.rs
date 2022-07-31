@@ -67,7 +67,7 @@ pub struct VrHand {
 #[derive(Default)]
 struct Models(SecondaryMap<ModelAssetKey, Vec<Matrix4<f32>>>);
 
-pub struct Game {
+pub struct LocalGame {
     world: World,
     schedule: Schedule,
     prev_vr_tracking: VrTracking,
@@ -86,7 +86,7 @@ struct GamePhysics {
     ccd_solver: CCDSolver,
 }
 
-impl Game {
+impl LocalGame {
     pub fn new(
         vk: &VkHandles,
         render: &RenderData,
@@ -181,31 +181,31 @@ impl Game {
             .insert(Grabbable { grabbed: false })
             .insert(RigidBody { handle: key_body });
 
-        let mut schedule = Schedule::default();
-        schedule.add_stage(
-            "reset_forces",
-            SystemStage::parallel().with_system(reset_forces),
-        );
-        schedule.add_stage_after(
-            "reset_forces",
-            "pre_step",
-            SystemStage::parallel().with_system(update_hands),
-        );
-        schedule.add_stage_after(
-            "pre_step",
-            "physics_step",
-            SystemStage::parallel().with_system(physics_step),
-        );
-        schedule.add_stage_after(
-            "physics_step",
-            "post_step",
-            SystemStage::parallel().with_system(update_rigid_body_transforms),
-        );
-        schedule.add_stage_after(
-            "post_step",
-            "render",
-            SystemStage::parallel().with_system(gather_models),
-        );
+        let schedule = Schedule::default()
+            .with_stage(
+                "reset_forces",
+                SystemStage::parallel().with_system(reset_forces),
+            )
+            .with_stage_after(
+                "reset_forces",
+                "pre_step",
+                SystemStage::parallel().with_system(update_hands),
+            )
+            .with_stage_after(
+                "pre_step",
+                "physics_step",
+                SystemStage::parallel().with_system(physics_step),
+            )
+            .with_stage_after(
+                "physics_step",
+                "post_step",
+                SystemStage::parallel().with_system(update_rigid_body_transforms),
+            )
+            .with_stage_after(
+                "post_step",
+                "render",
+                SystemStage::parallel().with_system(gather_models),
+            );
 
         world.insert_resource(GamePhysics {
             bodies,
