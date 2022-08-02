@@ -1,3 +1,6 @@
+#![feature(generic_associated_types)]
+#![feature(type_alias_impl_trait)]
+
 use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::hash::Hash;
@@ -7,7 +10,6 @@ use std::net::SocketAddr;
 use futures::TryFutureExt;
 use tokio::net::UdpSocket;
 
-#[cfg(test)]
 pub mod testing;
 
 pub trait BoundSocket {

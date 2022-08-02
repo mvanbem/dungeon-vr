@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::mpsc;
 
-use crate::socket::BoundSocket;
+use crate::BoundSocket;
 
 #[derive(Clone)]
 pub struct FakeNetwork<A> {

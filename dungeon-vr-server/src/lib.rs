@@ -1,6 +1,3 @@
-#![feature(generic_associated_types)]
-#![feature(type_alias_impl_trait)]
-
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::future::pending;
@@ -18,6 +15,7 @@ use dungeon_vr_shared::protocol::connect_init_packet::ConnectInitPacket;
 use dungeon_vr_shared::protocol::packet::Packet;
 use dungeon_vr_shared::protocol::sealed::Sealed;
 use dungeon_vr_shared::protocol::{GAME_ID, SAFE_RECV_BUFFER_SIZE};
+use dungeon_vr_socket::BoundSocket;
 use dungeon_vr_stream_codec::StreamCodec;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -25,9 +23,10 @@ use tokio::select;
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::{interval, sleep, Duration, Instant, Interval, Sleep};
 
-use crate::socket::BoundSocket;
-
-mod socket;
+#[cfg(test)]
+mod testing;
+#[cfg(test)]
+mod tests;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -59,6 +58,11 @@ impl Server {
     pub async fn join(self) -> Result<(), JoinError> {
         self.join_handle.await?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn cancel_token(&self) -> &cancel::Token {
+        &self.cancel_guard
     }
 
     pub async fn shutdown(self) -> Result<(), JoinError> {
@@ -166,9 +170,10 @@ impl<S: BoundSocket> InnerServer<S> {
             return;
         }
         match packet {
-            Packet::Disconnect(packet) => return self.handle_disconnect_packet(peer, packet),
+            Packet::Disconnect(sealed) => return self.handle_disconnect_packet(peer, sealed),
             Packet::ConnectInit(packet) => return self.handle_connect_init_packet(peer, packet),
             Packet::ConnectResponse(sealed) => self.handle_connect_response_packet(peer, sealed),
+            Packet::Keepalive(sealed) => self.handle_keepalive_packet(peer, sealed),
             _ => log::debug!(
                 "Peer {peer}: Dropping unexpected {:?} packet",
                 packet.kind(),
@@ -176,7 +181,7 @@ impl<S: BoundSocket> InnerServer<S> {
         }
     }
 
-    fn handle_disconnect_packet(&mut self, peer: <S as BoundSocket>::Addr, packet: Sealed<()>) {
+    fn handle_disconnect_packet(&mut self, peer: <S as BoundSocket>::Addr, sealed: Sealed<()>) {
         let connection = match self.connections.get_mut(&peer) {
             Some(connection) => connection,
             None => {
@@ -184,7 +189,7 @@ impl<S: BoundSocket> InnerServer<S> {
                 return;
             }
         };
-        if let Err(e) = packet.open(&connection.shared_secret) {
+        if let Err(e) = sealed.open(&connection.shared_secret) {
             log::debug!("Peer {peer}: Dropping Disconnect packet: {e}");
             return;
         }
@@ -288,6 +293,24 @@ impl<S: BoundSocket> InnerServer<S> {
             keepalive: Box::pin(sleep(Duration::ZERO)),
         });
         log::info!("Peer {peer}: Connected");
+    }
+
+    fn handle_keepalive_packet(&mut self, peer: <S as BoundSocket>::Addr, sealed: Sealed<()>) {
+        let connection = match self.connections.get_mut(&peer) {
+            Some(connection) => connection,
+            None => {
+                log::debug!("Peer {peer}: Dropping Keepalive packet: not connected");
+                return;
+            }
+        };
+        match sealed.open(&connection.shared_secret) {
+            Ok(token) => token,
+            Err(e) => {
+                log::debug!("Peer {peer}: Dropping Keepalive packet: {e}");
+                return;
+            }
+        }
+        connection.refresh_timeout();
     }
 
     fn handle_tick(&mut self) {
@@ -498,298 +521,5 @@ impl ClientIdAllocator {
         let client_id = self.next;
         self.next = ClientId(NonZeroU8::new(self.next.0.get() + 1).unwrap());
         client_id
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-    use std::fmt::{self, Debug, Display, Formatter};
-    use std::marker::PhantomData;
-    use std::time::Duration;
-
-    use dungeon_vr_cryptography::{PrivateKey, PublicKey, SharedSecret};
-    use dungeon_vr_shared::cancel;
-    use dungeon_vr_shared::net_game::NetGame;
-    use dungeon_vr_shared::protocol::challenge_token::ChallengeToken;
-    use dungeon_vr_shared::protocol::connect_init_packet::ConnectInitPacket;
-    use dungeon_vr_shared::protocol::packet::Packet;
-    use dungeon_vr_shared::protocol::sealed::Sealed;
-    use dungeon_vr_shared::protocol::{GAME_ID, SAFE_RECV_BUFFER_SIZE};
-    use dungeon_vr_stream_codec::StreamCodec;
-    use tokio::time::{interval, sleep, timeout_at, Instant};
-
-    use crate::socket::testing::{FakeNetwork, FakeSocket};
-    use crate::socket::BoundSocket;
-    use crate::{
-        ClientIdAllocator, Connection, ConnectionVariant, InnerServer, PendingConnection, TickId,
-        CLIENT_TIMEOUT_INTERVAL, CONNECT_CHALLENGE_INTERVAL, TICK_INTERVAL,
-    };
-
-    use super::Server;
-
-    async fn recv_packet<S: BoundSocket>(socket: &S) -> Packet {
-        let mut buf = [0; SAFE_RECV_BUFFER_SIZE];
-        let (size, _) = socket.recv_from(&mut buf).await.unwrap();
-        let mut r = &buf[..size];
-        let packet = Packet::read_from(&mut r).unwrap();
-        assert!(r.is_empty());
-        packet
-    }
-
-    async fn send_packet_to<S: BoundSocket>(
-        socket: &S,
-        packet: Packet,
-        addr: <S as BoundSocket>::Addr,
-    ) {
-        let mut buf = Vec::new();
-        packet.write_to(&mut buf).unwrap();
-        socket.send_to(&buf, addr).await.unwrap();
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    enum FakeAddr {
-        Server,
-        Client1,
-    }
-
-    impl Display for FakeAddr {
-        fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-            <Self as Debug>::fmt(self, f)
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn handshake_integration_test() {
-        let network = FakeNetwork::new();
-        let server = Server::spawn(network.bind(FakeAddr::Server));
-        let socket = network.bind(FakeAddr::Client1);
-
-        // Send a ConnectInit packet.
-        let client_private_key = PrivateKey::gen();
-        let client_public_key = client_private_key.to_public();
-        send_packet_to(
-            &socket,
-            Packet::ConnectInit(ConnectInitPacket {
-                game_id: GAME_ID,
-                client_public_key,
-            }),
-            FakeAddr::Server,
-        )
-        .await;
-
-        println!("Waiting for a ConnectChallenge packet");
-        let packet = match recv_packet(&socket).await {
-            Packet::ConnectChallenge(packet) => packet,
-            _ => unreachable!(),
-        };
-        let shared_secret = client_private_key
-            .exchange(&packet.server_public_key)
-            .unwrap();
-        let token = packet.sealed_payload.open(&shared_secret).unwrap();
-
-        // Send a ConnectResponse packet.
-        send_packet_to(
-            &socket,
-            Packet::ConnectResponse(Sealed::seal(token, &shared_secret)),
-            FakeAddr::Server,
-        )
-        .await;
-
-        println!("Waiting for a Keepalive packet");
-        let packet = match recv_packet(&socket).await {
-            Packet::Keepalive(packet) => packet,
-            _ => unreachable!(),
-        };
-        packet.open(&shared_secret).unwrap();
-
-        server.shutdown().await.unwrap();
-    }
-
-    fn make_network_and_inner_server() -> (FakeNetwork<FakeAddr>, InnerServer<FakeSocket<FakeAddr>>)
-    {
-        let network = FakeNetwork::new();
-        let server = InnerServer {
-            cancel: cancel::Token::new(),
-            socket: network.bind(FakeAddr::Server),
-            game: NetGame::new(),
-            connections: HashMap::new(),
-            client_ids: ClientIdAllocator::new(),
-            tick_interval: interval(TICK_INTERVAL),
-            tick_id: TickId(0),
-        };
-        (network, server)
-    }
-
-    struct InitWithPendingConnection {
-        network: FakeNetwork<FakeAddr>,
-        server: InnerServer<FakeSocket<FakeAddr>>,
-        client_private_key: PrivateKey,
-        client_public_key: PublicKey,
-        server_private_key: PrivateKey,
-        server_public_key: PublicKey,
-        shared_secret: SharedSecret,
-        token: ChallengeToken,
-    }
-
-    fn init_with_pending_connection() -> InitWithPendingConnection {
-        let (network, mut server) = make_network_and_inner_server();
-        let client_private_key = PrivateKey::gen();
-        let client_public_key = client_private_key.to_public();
-        let server_private_key = PrivateKey::gen();
-        let server_public_key = server_private_key.to_public();
-        let shared_secret = server_private_key.exchange(&client_public_key).unwrap();
-        let token = ChallengeToken::gen();
-        server.connections.insert(
-            FakeAddr::Client1,
-            Connection {
-                shared_secret,
-                timeout: Some(Box::pin(sleep(CLIENT_TIMEOUT_INTERVAL))),
-                variant: ConnectionVariant::Pending(PendingConnection {
-                    server_public_key,
-                    token,
-                    send_interval: interval(CONNECT_CHALLENGE_INTERVAL),
-                }),
-                _phantom_socket: PhantomData,
-            },
-        );
-        InitWithPendingConnection {
-            network,
-            server,
-            client_private_key,
-            client_public_key,
-            server_private_key,
-            server_public_key,
-            shared_secret,
-            token,
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn recv_connectinit_when_no_connection_should_create_pending_connection() {
-        let (network, mut server) = make_network_and_inner_server();
-        let socket = network.bind(FakeAddr::Client1);
-        send_packet_to(
-            &socket,
-            Packet::ConnectInit(ConnectInitPacket {
-                game_id: GAME_ID,
-                client_public_key: PrivateKey::gen().to_public(),
-            }),
-            FakeAddr::Server,
-        )
-        .await;
-
-        server.run_once_for_test().await;
-
-        let connection = server.connections.get(&FakeAddr::Client1).unwrap();
-        assert!(matches!(connection.variant, ConnectionVariant::Pending(_)));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn recv_connectinit_when_connection_pending_should_not_change() {
-        let InitWithPendingConnection {
-            network,
-            mut server,
-            server_public_key,
-            token,
-            ..
-        } = init_with_pending_connection();
-        let socket = network.bind(FakeAddr::Client1);
-        send_packet_to(
-            &socket,
-            Packet::ConnectInit(ConnectInitPacket {
-                game_id: GAME_ID,
-                client_public_key: PrivateKey::gen().to_public(),
-            }),
-            FakeAddr::Server,
-        )
-        .await;
-
-        server.run_once_for_test().await;
-
-        let connection = server.connections.get(&FakeAddr::Client1).unwrap();
-        let pending = match &connection.variant {
-            ConnectionVariant::Pending(pending) => pending,
-            _ => unreachable!(),
-        };
-        assert_eq!(server_public_key, pending.server_public_key);
-        assert_eq!(token, pending.token);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn recv_connectresponse_when_connection_pending_should_connect() {
-        let InitWithPendingConnection {
-            network,
-            mut server,
-            shared_secret,
-            token,
-            ..
-        } = init_with_pending_connection();
-        let socket = network.bind(FakeAddr::Client1);
-        send_packet_to(
-            &socket,
-            Packet::ConnectResponse(Sealed::seal(token, &shared_secret)),
-            FakeAddr::Server,
-        )
-        .await;
-
-        server.run_once_for_test().await;
-
-        let connection = server.connections.get(&FakeAddr::Client1).unwrap();
-        assert!(matches!(
-            connection.variant,
-            ConnectionVariant::Connected(_),
-        ));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn pending_connection_should_send_challenges() {
-        let InitWithPendingConnection {
-            network,
-            server,
-            client_private_key,
-            server_public_key,
-            token,
-            ..
-        } = init_with_pending_connection();
-        let socket = network.bind(FakeAddr::Client1);
-
-        tokio::spawn(server.run());
-
-        for _ in 0..3 {
-            let packet = match recv_packet(&socket).await {
-                Packet::ConnectChallenge(packet) => packet,
-                _ => unreachable!(),
-            };
-            assert_eq!(server_public_key, packet.server_public_key);
-            assert_eq!(
-                token,
-                packet
-                    .sealed_payload
-                    .open(
-                        &client_private_key
-                            .exchange(&packet.server_public_key)
-                            .unwrap(),
-                    )
-                    .unwrap(),
-            );
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn pending_connection_should_time_out() {
-        let InitWithPendingConnection { mut server, .. } = init_with_pending_connection();
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            timeout_at(deadline, server.run_once_for_test())
-                .await
-                .unwrap();
-            let connection = server.connections.get(&FakeAddr::Client1).unwrap();
-            if matches!(connection.variant, ConnectionVariant::Disconnecting(_)) {
-                // Success.
-                break;
-            }
-        }
     }
 }

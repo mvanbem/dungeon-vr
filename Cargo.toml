@@ -6,5 +6,6 @@ members = [
     "dungeon-vr-dedicated",
     "dungeon-vr-server",
     "dungeon-vr-shared",
+    "dungeon-vr-socket",
     "dungeon-vr-stream-codec",
 ]

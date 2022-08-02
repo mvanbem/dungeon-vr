@@ -683,6 +683,7 @@ version = "0.1.0"
 dependencies = [
  "dungeon-vr-cryptography",
  "dungeon-vr-shared",
+ "dungeon-vr-socket",
  "dungeon-vr-stream-codec",
  "futures",
  "log",
@@ -704,6 +705,14 @@ dependencies = [
  "rapier3d",
  "replace_with",
  "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "dungeon-vr-socket"
+version = "0.1.0"
+dependencies = [
+ "futures",
  "tokio",
 ]
 

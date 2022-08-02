@@ -9,6 +9,7 @@ license = "MIT"
 [dependencies]
 dungeon-vr-cryptography = { path = "../dungeon-vr-cryptography" }
 dungeon-vr-shared = { path = "../dungeon-vr-shared" }
+dungeon-vr-socket = { path = "../dungeon-vr-socket" }
 dungeon-vr-stream-codec = { path = "../dungeon-vr-stream-codec" }
 futures = "0.3"
 log = "0.4"
