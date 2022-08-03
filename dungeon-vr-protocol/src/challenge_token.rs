@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use dungeon_vr_stream_codec::StreamCodec;
 use rand_core::{OsRng, RngCore};
 
-use crate::protocol::packet::ReadPacketError;
+use crate::packet::ReadPacketError;
 
 /// A challenge token, a block of random data the client must echo to demonstrate its ability to
 /// receive and send packets at its address and its knowledge of the shared secret.

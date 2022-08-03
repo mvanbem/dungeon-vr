@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::pending;
 use std::io;
@@ -7,20 +7,20 @@ use std::num::NonZeroU8;
 use std::pin::Pin;
 
 use dungeon_vr_cryptography::{KeyExchangeError, PrivateKey, PublicKey, SharedSecret};
+use dungeon_vr_protocol::challenge_token::ChallengeToken;
+use dungeon_vr_protocol::connect_challenge_packet::ConnectChallengePacket;
+use dungeon_vr_protocol::connect_init_packet::ConnectInitPacket;
+use dungeon_vr_protocol::packet::Packet;
+use dungeon_vr_protocol::sealed::Sealed;
+use dungeon_vr_protocol::{GAME_ID, SAFE_RECV_BUFFER_SIZE};
 use dungeon_vr_shared::cancel;
-use dungeon_vr_shared::net_game::{ClientId, Input, NetGame};
-use dungeon_vr_shared::protocol::challenge_token::ChallengeToken;
-use dungeon_vr_shared::protocol::connect_challenge_packet::ConnectChallengePacket;
-use dungeon_vr_shared::protocol::connect_init_packet::ConnectInitPacket;
-use dungeon_vr_shared::protocol::packet::Packet;
-use dungeon_vr_shared::protocol::sealed::Sealed;
-use dungeon_vr_shared::protocol::{GAME_ID, SAFE_RECV_BUFFER_SIZE};
+use dungeon_vr_shared::net_game::PlayerId;
 use dungeon_vr_socket::BoundSocket;
-use dungeon_vr_stream_codec::StreamCodec;
+use dungeon_vr_stream_codec::{StreamCodec, UnframedByteVec};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
 use tokio::select;
-use tokio::task::{JoinError, JoinHandle};
+use tokio::sync::mpsc;
 use tokio::time::{interval, sleep, Duration, Instant, Interval, Sleep};
 
 #[cfg(test)]
@@ -28,132 +28,194 @@ mod testing;
 #[cfg(test)]
 mod tests;
 
-const TICK_INTERVAL: Duration = Duration::from_millis(50);
-
-const DISCONNECT_INTERVAL: Duration = Duration::from_millis(250);
+const SEND_INTERVAL: Duration = Duration::from_millis(250);
 const DISCONNECT_PACKET_COUNT: usize = 10;
-const CONNECT_CHALLENGE_INTERVAL: Duration = Duration::from_millis(250);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 const CLIENT_TIMEOUT_INTERVAL: Duration = Duration::from_secs(5);
+const REQUEST_BUFFER_SIZE: usize = 256;
+const EVENT_BUFFER_SIZE: usize = 256;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct TickId(u32);
-
-pub struct Server {
-    cancel_guard: cancel::Guard,
-    join_handle: JoinHandle<()>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Request {
+    SendGameData { player_id: PlayerId, data: Vec<u8> },
 }
 
-impl Server {
-    pub fn spawn<S: BoundSocket + Send + Sync + 'static>(socket: S) -> Self {
-        let cancel = cancel::Token::new();
-        let join_handle = tokio::spawn(InnerServer::new(cancel.clone(), socket).run());
-
-        Self {
-            cancel_guard: cancel.guard(),
-            join_handle,
-        }
-    }
-
-    pub async fn join(self) -> Result<(), JoinError> {
-        self.join_handle.await?;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn cancel_token(&self) -> &cancel::Token {
-        &self.cancel_guard
-    }
-
-    pub async fn shutdown(self) -> Result<(), JoinError> {
-        drop(self.cancel_guard);
-        self.join_handle.await?;
-        Ok(())
-    }
-}
-
-struct InnerServer<S: BoundSocket> {
-    cancel: cancel::Token,
+pub struct ServerConnection<S: BoundSocket> {
     socket: S,
-    game: NetGame,
+    requests: Option<mpsc::Receiver<Request>>,
+    events: mpsc::Sender<Event>,
+    recv_buffer: Pin<Box<[u8; SAFE_RECV_BUFFER_SIZE]>>,
     connections: HashMap<<S as BoundSocket>::Addr, Connection<S>>,
-    client_ids: ClientIdAllocator,
-    tick_interval: Interval,
-    tick_id: TickId,
+    player_ids: PlayerIdAllocator,
 }
 
 #[derive(Debug)]
-enum Event<A> {
+enum InternalEvent<A> {
+    Cancelled,
+    Request(Option<Request>),
     SocketRecv(io::Result<(usize, A)>),
-    Tick,
     ClientTimeout { peer: A },
     DisconnectElapsed { peer: A },
-    PendingConnectionSend { peer: A },
+    SendIntervalElapsed { peer: A },
     KeepaliveElapsed { peer: A },
 }
 
-impl<S: BoundSocket> InnerServer<S> {
-    fn new(cancel: cancel::Token, socket: S) -> Self {
-        Self {
-            cancel,
-            socket,
-            game: NetGame::new(),
-            connections: HashMap::new(),
-            client_ids: ClientIdAllocator::new(),
-            tick_interval: interval(TICK_INTERVAL),
-            tick_id: TickId(0),
-        }
-    }
-
-    async fn run(mut self) {
-        let mut buf = [0; SAFE_RECV_BUFFER_SIZE];
-        while !self.cancel.is_cancelled() {
-            self.run_once(&mut buf).await;
-        }
-    }
-
+#[must_use]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
     #[cfg(test)]
-    async fn run_once_for_test(&mut self) {
-        let mut buf = [0; SAFE_RECV_BUFFER_SIZE];
-        self.run_once(&mut buf).await;
+    PeerConnecting,
+    #[cfg(test)]
+    PeerDisconnected,
+    PlayerConnected {
+        player_id: PlayerId,
+    },
+    PlayerDisconnected {
+        player_id: PlayerId,
+    },
+    GameData {
+        player_id: PlayerId,
+        data: Vec<u8>,
+    },
+    Dropped,
+}
+
+impl<S: BoundSocket> ServerConnection<S> {
+    pub fn spawn(socket: S) -> (cancel::Guard, mpsc::Sender<Request>, mpsc::Receiver<Event>)
+    where
+        S: BoundSocket + Send + Sync + 'static,
+    {
+        let cancel_token = cancel::Token::new();
+        let (request_tx, request_rx) = mpsc::channel(REQUEST_BUFFER_SIZE);
+        let (event_tx, event_rx) = mpsc::channel(EVENT_BUFFER_SIZE);
+
+        let connection = Self::new(socket, request_rx, event_tx);
+        tokio::spawn(connection.run(cancel_token.clone()));
+
+        (cancel_token.guard(), request_tx, event_rx)
     }
 
-    async fn run_once(&mut self, buf: &mut [u8; SAFE_RECV_BUFFER_SIZE]) {
-        let mut dynamic_events: FuturesUnordered<_> = self
-            .connections
-            .iter_mut()
-            .map(|(peer, connection)| connection.wait_for_event(*peer))
-            .collect();
-
-        let event = select! {
-            biased;
-
-            _ = self.cancel.cancelled() => return,
-
-            result = self.socket.recv_from(buf) => Event::SocketRecv(result),
-
-            _ = self.tick_interval.tick() => Event::Tick,
-
-            Some(event) = dynamic_events.next() => event,
-        };
-        drop(dynamic_events);
-
-        match event {
-            Event::SocketRecv(Ok((size, peer))) => {
-                self.handle_socket_recv(&buf[..size], peer);
-            }
-            Event::SocketRecv(Err(e)) => log::error!("Unexpected socket error: {e}"),
-            Event::Tick => self.handle_tick(),
-            Event::ClientTimeout { peer } => self.handle_client_timeout(peer),
-            Event::DisconnectElapsed { peer } => self.handle_disconnect_elapsed(peer).await,
-            Event::PendingConnectionSend { peer } => {
-                self.handle_pending_connection_send(peer).await
-            }
-            Event::KeepaliveElapsed { peer } => self.handle_keepalive_elapsed(peer).await,
+    fn new(socket: S, requests: mpsc::Receiver<Request>, events: mpsc::Sender<Event>) -> Self {
+        Self {
+            socket,
+            requests: Some(requests),
+            events,
+            recv_buffer: Box::pin([0; SAFE_RECV_BUFFER_SIZE]),
+            connections: HashMap::new(),
+            player_ids: PlayerIdAllocator::new(),
         }
     }
 
-    fn handle_socket_recv(&mut self, mut r: &[u8], peer: <S as BoundSocket>::Addr) {
+    async fn run(mut self, cancel_token: cancel::Token) {
+        while !cancel_token.is_cancelled() {
+            let requests = match &mut self.requests {
+                Some(requests) => requests.recv().left_future(),
+                None => pending().right_future(),
+            };
+            let mut dynamic_events: FuturesUnordered<_> = self
+                .connections
+                .iter_mut()
+                .map(|(peer, connection)| connection.wait_for_event(*peer))
+                .collect();
+
+            let event = select! {
+                biased;
+
+                _ = cancel_token.cancelled() => InternalEvent::Cancelled,
+
+                result = requests => InternalEvent::Request(result),
+
+                result = self.socket.recv_from(&mut self.recv_buffer[..]) => InternalEvent::SocketRecv(result),
+
+                Some(event) = dynamic_events.next() => event,
+            };
+            drop(dynamic_events);
+
+            match event {
+                InternalEvent::Cancelled => {
+                    self.handle_cancelled().await;
+                    break;
+                }
+                InternalEvent::Request(Some(request)) => self.handle_request(request).await,
+                InternalEvent::Request(None) => self.requests = None,
+                InternalEvent::SocketRecv(Ok((size, peer))) => {
+                    self.handle_socket_recv(size, peer).await
+                }
+                InternalEvent::SocketRecv(Err(e)) => log::error!("Unexpected socket error: {e}"),
+                InternalEvent::ClientTimeout { peer } => self.handle_client_timeout(peer).await,
+                InternalEvent::DisconnectElapsed { peer } => {
+                    self.handle_disconnect_elapsed(peer).await
+                }
+                InternalEvent::SendIntervalElapsed { peer } => {
+                    self.handle_pending_connection_send(peer).await
+                }
+                InternalEvent::KeepaliveElapsed { peer } => {
+                    self.handle_keepalive_elapsed(peer).await
+                }
+            }
+        }
+
+        // Drop everything except for the event sender. This lets the event receiver know the socket
+        // has already been dropped when it receives the Dropped event.
+        drop(self.socket);
+        drop(self.requests);
+        drop(self.recv_buffer);
+        drop(self.connections);
+        drop(self.player_ids);
+        drop(cancel_token);
+
+        let _ = self.events.send(Event::Dropped).await;
+    }
+
+    async fn handle_cancelled(&mut self) {
+        // TODO: Introduce a Disconnecting variant and put all connections into the Disconnecting
+        // state until they finish shutting down.
+
+        // For now, just tell the event reciever that each connected player has disconnected.
+
+        for (_peer, connection) in self.connections.drain() {
+            if let ConnectionVariant::Connected(connected) = connection.variant {
+                let _ = self
+                    .events
+                    .send(Event::PlayerDisconnected {
+                        player_id: connected.player_id,
+                    })
+                    .await;
+            };
+        }
+    }
+
+    async fn handle_request(&mut self, request: Request) {
+        match request {
+            Request::SendGameData { player_id, data } => {
+                self.handle_send_game_data_request(player_id, data).await
+            }
+        }
+    }
+
+    async fn handle_send_game_data_request(&mut self, player_id: PlayerId, data: Vec<u8>) {
+        // TODO: Secondary index of connected connections by player ID!
+        for (&peer, connection) in &self.connections {
+            if let ConnectionVariant::Connected(connected) = &connection.variant {
+                if connected.player_id == player_id {
+                    send_packet(
+                        &self.socket,
+                        peer,
+                        Packet::GameData(Sealed::seal_ext::<UnframedByteVec>(
+                            data,
+                            &connection.shared_secret,
+                        )),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+        log::debug!("Dropping outgoing game data: no connection for player ID {player_id:?}",);
+    }
+
+    async fn handle_socket_recv(&mut self, size: usize, peer: <S as BoundSocket>::Addr) {
+        let mut r = &self.recv_buffer[..size];
         let packet = match Packet::read_from(&mut r) {
             Ok(packet) => packet,
             Err(e) => {
@@ -170,18 +232,27 @@ impl<S: BoundSocket> InnerServer<S> {
             return;
         }
         match packet {
-            Packet::Disconnect(sealed) => return self.handle_disconnect_packet(peer, sealed),
-            Packet::ConnectInit(packet) => return self.handle_connect_init_packet(peer, packet),
-            Packet::ConnectResponse(sealed) => self.handle_connect_response_packet(peer, sealed),
+            Packet::Disconnect(sealed) => self.handle_disconnect_packet(peer, sealed).await,
+            Packet::ConnectInit(packet) => self.handle_connect_init_packet(peer, packet).await,
+            Packet::ConnectResponse(sealed) => {
+                self.handle_connect_response_packet(peer, sealed).await;
+            }
             Packet::Keepalive(sealed) => self.handle_keepalive_packet(peer, sealed),
-            _ => log::debug!(
-                "Peer {peer}: Dropping unexpected {:?} packet",
-                packet.kind(),
-            ),
+            Packet::GameData(sealed) => self.handle_game_data_packet(peer, sealed).await,
+            _ => {
+                log::debug!(
+                    "Peer {peer}: Dropping unexpected {:?} packet",
+                    packet.kind(),
+                );
+            }
         }
     }
 
-    fn handle_disconnect_packet(&mut self, peer: <S as BoundSocket>::Addr, sealed: Sealed<()>) {
+    async fn handle_disconnect_packet(
+        &mut self,
+        peer: <S as BoundSocket>::Addr,
+        sealed: Sealed<()>,
+    ) {
         let connection = match self.connections.get_mut(&peer) {
             Some(connection) => connection,
             None => {
@@ -194,11 +265,22 @@ impl<S: BoundSocket> InnerServer<S> {
             return;
         }
 
-        log::info!("Peer {peer}: Disconnected");
+        let event = match connection.variant {
+            #[cfg(test)]
+            ConnectionVariant::Pending(_) => Some(Event::PeerDisconnected),
+            ConnectionVariant::Connected(ConnectedConnection { player_id, .. }) => {
+                Some(Event::PlayerDisconnected { player_id })
+            }
+            _ => None,
+        };
         self.connections.remove(&peer);
+        log::info!("Peer {peer}: Disconnected");
+        if let Some(event) = event {
+            let _ = self.events.send(event).await;
+        }
     }
 
-    fn handle_connect_init_packet(
+    async fn handle_connect_init_packet(
         &mut self,
         peer: <S as BoundSocket>::Addr,
         packet: ConnectInitPacket,
@@ -238,15 +320,17 @@ impl<S: BoundSocket> InnerServer<S> {
                 variant: ConnectionVariant::Pending(PendingConnection {
                     server_public_key,
                     token,
-                    send_interval: interval(CONNECT_CHALLENGE_INTERVAL),
+                    send_interval: interval(SEND_INTERVAL),
                 }),
                 _phantom_socket: PhantomData,
             },
         );
         log::info!("Peer {peer}: New connection pending");
+        #[cfg(test)]
+        let _ = self.events.send(Event::PeerConnecting).await;
     }
 
-    fn handle_connect_response_packet(
+    async fn handle_connect_response_packet(
         &mut self,
         peer: <S as BoundSocket>::Addr,
         sealed: Sealed<ChallengeToken>,
@@ -286,13 +370,13 @@ impl<S: BoundSocket> InnerServer<S> {
         }
 
         // Advance this connection to the Connected state.
-        let client_id = self.client_ids.allocate();
+        let player_id = self.player_ids.allocate();
         connection.variant = ConnectionVariant::Connected(ConnectedConnection {
-            client_id,
-            input_buffer: BTreeMap::default(),
+            player_id,
             keepalive: Box::pin(sleep(Duration::ZERO)),
         });
         log::info!("Peer {peer}: Connected");
+        let _ = self.events.send(Event::PlayerConnected { player_id }).await;
     }
 
     fn handle_keepalive_packet(&mut self, peer: <S as BoundSocket>::Addr, sealed: Sealed<()>) {
@@ -304,7 +388,7 @@ impl<S: BoundSocket> InnerServer<S> {
             }
         };
         match sealed.open(&connection.shared_secret) {
-            Ok(token) => token,
+            Ok(()) => (),
             Err(e) => {
                 log::debug!("Peer {peer}: Dropping Keepalive packet: {e}");
                 return;
@@ -313,36 +397,55 @@ impl<S: BoundSocket> InnerServer<S> {
         connection.refresh_timeout();
     }
 
-    fn handle_tick(&mut self) {
-        // Gather the current buffered inputs for this tick from each connection.
-        let mut player_inputs = BTreeMap::new();
-        for connection in self.connections.values_mut() {
-            if let ConnectionVariant::Connected(ConnectedConnection {
-                client_id,
-                input_buffer,
-                ..
-            }) = &mut connection.variant
-            {
-                if let Some(inputs) = input_buffer.remove(&self.tick_id) {
-                    player_inputs.insert(*client_id, inputs);
-                }
+    async fn handle_game_data_packet(
+        &mut self,
+        peer: <S as BoundSocket>::Addr,
+        sealed: Sealed<Vec<u8>>,
+    ) {
+        let connection = match self.connections.get_mut(&peer) {
+            Some(connection) => connection,
+            None => {
+                log::debug!("Peer {peer}: Dropping GameData packet: not connected");
+                return;
             }
-        }
-        self.game.update(player_inputs);
-
-        // TODO: Send (delta) updates.
-
-        self.tick_id = TickId(self.tick_id.0 + 1);
+        };
+        let player_id = match connection.variant {
+            ConnectionVariant::Connected(ConnectedConnection { player_id, .. }) => player_id,
+            _ => {
+                log::debug!("Peer {peer}: Dropping GameData packet: not connected");
+                return;
+            }
+        };
+        let data = match sealed.open_ext::<UnframedByteVec>(&connection.shared_secret) {
+            Ok(game_data) => game_data,
+            Err(e) => {
+                log::debug!("Peer {peer}: Dropping GameData packet: {e}");
+                return;
+            }
+        };
+        connection.refresh_timeout();
+        let _ = self.events.send(Event::GameData { player_id, data }).await;
     }
 
-    fn handle_client_timeout(&mut self, peer: <S as BoundSocket>::Addr) {
+    async fn handle_client_timeout(&mut self, peer: <S as BoundSocket>::Addr) {
         let connection = self.connections.get_mut(&peer).unwrap();
+        let event = match connection.variant {
+            #[cfg(test)]
+            ConnectionVariant::Pending(_) => Some(Event::PeerDisconnected),
+            ConnectionVariant::Connected(ConnectedConnection { player_id, .. }) => {
+                Some(Event::PlayerDisconnected { player_id })
+            }
+            _ => None,
+        };
         connection.timeout = None;
         connection.variant = ConnectionVariant::Disconnecting(DisconnectingConnection {
-            interval: interval(DISCONNECT_INTERVAL),
+            interval: interval(SEND_INTERVAL),
             packets_to_send: DISCONNECT_PACKET_COUNT,
         });
-        log::info!("Peer {peer}: Disconnecting (timed out)")
+        log::info!("Peer {peer}: Disconnecting (timed out)");
+        if let Some(event) = event {
+            let _ = self.events.send(event).await;
+        }
     }
 
     async fn handle_disconnect_elapsed(&mut self, peer: <S as BoundSocket>::Addr) {
@@ -427,8 +530,7 @@ struct PendingConnection {
 }
 
 struct ConnectedConnection {
-    client_id: ClientId,
-    input_buffer: BTreeMap<TickId, Vec<Input>>,
+    player_id: PlayerId,
     keepalive: Pin<Box<Sleep>>,
 }
 
@@ -444,12 +546,12 @@ where
     async fn wait_for_event(
         &mut self,
         peer: <S as BoundSocket>::Addr,
-    ) -> Event<<S as BoundSocket>::Addr> {
+    ) -> InternalEvent<<S as BoundSocket>::Addr> {
         let timeout = match &mut self.timeout {
             Some(timeout) => timeout.left_future(),
             None => pending().right_future(),
         };
-        let (pending_send, keepalive_elapsed, disconnect_elapsed) = match &mut self.variant {
+        let (send_interval, keepalive_elapsed, disconnect_elapsed) = match &mut self.variant {
             ConnectionVariant::Pending(PendingConnection { send_interval, .. }) => (
                 send_interval.tick().left_future(),
                 pending().right_future(),
@@ -470,13 +572,13 @@ where
         select! {
             biased;
 
-            _ = pending_send => Event::PendingConnectionSend { peer },
+            _ = send_interval => InternalEvent::SendIntervalElapsed { peer },
 
-            _ = keepalive_elapsed => Event::KeepaliveElapsed { peer },
+            _ = keepalive_elapsed => InternalEvent::KeepaliveElapsed { peer },
 
-            _ = disconnect_elapsed => Event::DisconnectElapsed { peer },
+            _ = disconnect_elapsed => InternalEvent::DisconnectElapsed { peer },
 
-            _ = timeout => Event::ClientTimeout { peer },
+            _ = timeout => InternalEvent::ClientTimeout { peer },
         }
     }
 
@@ -506,20 +608,20 @@ impl ConnectedConnection {
     }
 }
 
-struct ClientIdAllocator {
-    next: ClientId,
+struct PlayerIdAllocator {
+    next: PlayerId,
 }
 
-impl ClientIdAllocator {
+impl PlayerIdAllocator {
     fn new() -> Self {
         Self {
-            next: ClientId(NonZeroU8::new(1).unwrap()),
+            next: PlayerId(NonZeroU8::new(1).unwrap()),
         }
     }
 
-    fn allocate(&mut self) -> ClientId {
-        let client_id = self.next;
-        self.next = ClientId(NonZeroU8::new(self.next.0.get() + 1).unwrap());
-        client_id
+    fn allocate(&mut self) -> PlayerId {
+        let player_id = self.next;
+        self.next = PlayerId(NonZeroU8::new(self.next.0.get() + 1).unwrap());
+        player_id
     }
 }

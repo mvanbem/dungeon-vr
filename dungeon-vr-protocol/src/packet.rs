@@ -4,10 +4,10 @@ use dungeon_vr_cryptography::DecryptError;
 use dungeon_vr_stream_codec::{ReadError, StreamCodec};
 use thiserror::Error;
 
-use crate::protocol::challenge_token::ChallengeToken;
-use crate::protocol::connect_challenge_packet::ConnectChallengePacket;
-use crate::protocol::connect_init_packet::ConnectInitPacket;
-use crate::protocol::sealed::Sealed;
+use crate::challenge_token::ChallengeToken;
+use crate::connect_challenge_packet::ConnectChallengePacket;
+use crate::connect_init_packet::ConnectInitPacket;
+use crate::sealed::Sealed;
 
 #[derive(Debug, Error)]
 pub enum ReadPacketError {
@@ -38,6 +38,7 @@ pub enum PacketKind {
     ConnectChallenge,
     ConnectResponse,
     Keepalive,
+    GameData,
 }
 
 impl StreamCodec for PacketKind {
@@ -63,6 +64,7 @@ impl TryFrom<u8> for PacketKind {
             x if x == Self::ConnectChallenge as u8 => Ok(Self::ConnectChallenge),
             x if x == Self::ConnectResponse as u8 => Ok(Self::ConnectResponse),
             x if x == Self::Keepalive as u8 => Ok(Self::Keepalive),
+            x if x == Self::GameData as u8 => Ok(Self::GameData),
             x => Err(ReadPacketError::InvalidPacketType(x)),
         }
     }
@@ -74,6 +76,7 @@ pub enum Packet {
     ConnectChallenge(ConnectChallengePacket),
     ConnectResponse(Sealed<ChallengeToken>),
     Keepalive(Sealed<()>),
+    GameData(Sealed<Vec<u8>>),
 }
 
 impl Packet {
@@ -84,6 +87,7 @@ impl Packet {
             Self::ConnectChallenge(_) => PacketKind::ConnectChallenge,
             Self::ConnectResponse(_) => PacketKind::ConnectResponse,
             Self::Keepalive(_) => PacketKind::Keepalive,
+            Self::GameData(_) => PacketKind::GameData,
         }
     }
 }
@@ -101,6 +105,7 @@ impl StreamCodec for Packet {
             )),
             PacketKind::ConnectResponse => Ok(Self::ConnectResponse(Sealed::read_from(r)?)),
             PacketKind::Keepalive => Ok(Self::Keepalive(Sealed::read_from(r)?)),
+            PacketKind::GameData => Ok(Self::GameData(Sealed::read_from(r)?)),
         }
     }
 
@@ -112,6 +117,7 @@ impl StreamCodec for Packet {
             Self::ConnectChallenge(packet) => packet.write_to(w),
             Self::ConnectResponse(packet) => packet.write_to(w),
             Self::Keepalive(packet) => packet.write_to(w),
+            Self::GameData(packet) => packet.write_to(w),
         }
     }
 }
@@ -121,8 +127,8 @@ mod tests {
     use dungeon_vr_cryptography::SharedSecret;
     use dungeon_vr_stream_codec::StreamCodec;
 
-    use crate::protocol::challenge_token::ChallengeToken;
-    use crate::protocol::sealed::Sealed;
+    use crate::challenge_token::ChallengeToken;
+    use crate::sealed::Sealed;
 
     use super::Packet;
 

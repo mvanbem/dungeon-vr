@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use anyhow::Result;
 use clap::Parser;
-use dungeon_vr_server::Server;
+use dungeon_vr_server_connection::ServerConnection;
 use tokio::net::UdpSocket;
 
 #[derive(Parser, Debug)]
@@ -32,7 +32,10 @@ pub async fn main() -> Result<()> {
     };
     let socket = UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(ip, args.port))).await?;
     log::info!("Listening on {}", socket.local_addr()?);
+    let (_cancel_guard, _requests, mut events) = ServerConnection::spawn(socket);
 
-    Server::spawn(socket).join().await?;
+    while let Some(_event) = events.recv().await {
+        //
+    }
     Ok(())
 }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::net::SocketAddr;
+use std::mem::forget;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -10,11 +11,12 @@ use anyhow::Result;
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use clap::Parser;
-use dungeon_vr_client::Client;
+use dungeon_vr_client_connection::ClientConnection;
 use openxr as xr;
 use rapier3d::na as nalgebra;
 use rapier3d::na::{self, matrix, vector, Matrix4};
 use slotmap::Key;
+use tokio::net::UdpSocket;
 
 use crate::asset::{MaterialAssetKey, MaterialAssets, ModelAssets};
 use crate::interop::xr_posef_to_na_isometry;
@@ -71,11 +73,10 @@ pub async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     if let Some(host) = &args.connect {
-        let client = Client::spawn(SocketAddr::from_str(host).unwrap())
-            .await
-            .unwrap();
-        // TODO
-        Box::leak(Box::new(client));
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?;
+        socket.connect(SocketAddr::from_str(host).unwrap()).await?;
+        let (cancel_guard, _requests, _events) = ClientConnection::spawn(socket);
+        forget(cancel_guard);
     }
 
     let running = set_ctrlc_handler();

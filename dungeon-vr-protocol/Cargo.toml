@@ -1,5 +1,5 @@
 [package]
-name = "dungeon-vr-shared"
+name = "dungeon-vr-protocol"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
@@ -7,9 +7,7 @@ license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bevy_ecs = "0.7"
-byteorder = "1"
+dungeon-vr-cryptography = { path = "../dungeon-vr-cryptography" }
 dungeon-vr-stream-codec = { path = "../dungeon-vr-stream-codec" }
-rapier3d = { version = "0.14", features = ["simd-stable"] }
+rand_core = { version = "0.5", features = ["getrandom"] }
 thiserror = "1"
-tokio = { version = "1", features = ["sync"] }

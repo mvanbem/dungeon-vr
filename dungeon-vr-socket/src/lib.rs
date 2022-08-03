@@ -40,3 +40,29 @@ impl BoundSocket for UdpSocket {
         self.send_to(buf, addr).map_ok(|_| ())
     }
 }
+
+pub trait ConnectedSocket {
+    type Recv<'a>: Future<Output = io::Result<usize>> + Send
+    where
+        Self: 'a;
+
+    type Send<'a>: Future<Output = io::Result<()>> + Send
+    where
+        Self: 'a;
+
+    fn recv<'a>(&'a self, buf: &'a mut [u8]) -> Self::Recv<'a>;
+    fn send<'a>(&'a self, buf: &'a [u8]) -> Self::Send<'a>;
+}
+
+impl ConnectedSocket for UdpSocket {
+    type Recv<'a> = impl Future<Output = io::Result<usize>> + 'a;
+    type Send<'a> = impl Future<Output = io::Result<()>> + 'a;
+
+    fn recv<'a>(&'a self, buf: &'a mut [u8]) -> Self::Recv<'a> {
+        self.recv(buf)
+    }
+
+    fn send<'a>(&'a self, buf: &'a [u8]) -> Self::Send<'a> {
+        self.send(buf).map_ok(|_| ())
+    }
+}

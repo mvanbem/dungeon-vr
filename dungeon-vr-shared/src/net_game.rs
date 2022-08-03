@@ -15,8 +15,10 @@ pub enum ReadNetGameError {
     InvalidNetId,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ClientId(pub NonZeroU8);
+/// A small nonzero integer identifying a player currently connected to a game. A player's ID does
+/// not change while they are connected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PlayerId(pub NonZeroU8);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NetId(NonZeroU32);
@@ -45,13 +47,13 @@ struct Replicated {
 
 #[derive(Component)]
 struct Player {
-    client_id: ClientId,
+    player_id: PlayerId,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Authority {
     Server,
-    Client(ClientId),
+    Client(PlayerId),
 }
 
 impl StreamCodec for Authority {
@@ -61,7 +63,7 @@ impl StreamCodec for Authority {
     fn read_from(r: &mut &[u8]) -> Result<Self, ReadError> {
         Ok(match NonZeroU8::new(u8::read_from(r)?) {
             None => Self::Server,
-            Some(id) => Self::Client(ClientId(id)),
+            Some(id) => Self::Client(PlayerId(id)),
         })
     }
 
@@ -99,22 +101,22 @@ impl NetGame {
         }
     }
 
-    pub fn update(&mut self, player_inputs: BTreeMap<ClientId, Vec<Input>>) {
+    pub fn update(&mut self, player_inputs: BTreeMap<PlayerId, Vec<Input>>) {
         self.world.insert_resource(self.entities_by_net_id.clone());
         self.world.insert_resource(player_inputs);
         self.schedule.run(&mut self.world);
         self.world.remove_resource::<HashMap<NetId, Entity>>();
         self.world
-            .remove_resource::<HashMap<ClientId, Vec<Input>>>();
+            .remove_resource::<HashMap<PlayerId, Vec<Input>>>();
     }
 }
 
 fn apply_player_inputs(
     mut replicated_query: Query<&mut Replicated>,
     entities_by_net_id: Res<BTreeMap<NetId, Entity>>,
-    player_inputs: Res<BTreeMap<ClientId, Vec<Input>>>,
+    player_inputs: Res<BTreeMap<PlayerId, Vec<Input>>>,
 ) {
-    for (&client_id, inputs) in &*player_inputs {
+    for (&player_id, inputs) in &*player_inputs {
         for input in inputs {
             match input {
                 Input::Claim { net_id } => {
@@ -122,7 +124,7 @@ fn apply_player_inputs(
                         .get_mut(entities_by_net_id[&net_id])
                         .unwrap();
                     if replicated.authority == Authority::Server {
-                        replicated.authority = Authority::Client(client_id);
+                        replicated.authority = Authority::Client(player_id);
                     } else {
                         // The claim is either a no-op or is invalid. No action required.
                     }
@@ -131,7 +133,7 @@ fn apply_player_inputs(
                     let mut replicated = replicated_query
                         .get_mut(entities_by_net_id[&net_id])
                         .unwrap();
-                    if replicated.authority == Authority::Client(client_id) {
+                    if replicated.authority == Authority::Client(player_id) {
                         replicated.authority = Authority::Server;
                     } else {
                         // The yield is invalid. No action required.

@@ -630,7 +630,8 @@ dependencies = [
  "clap",
  "cstr",
  "ctrlc",
- "dungeon-vr-client",
+ "dungeon-vr-client-connection",
+ "dungeon-vr-client-session",
  "env_logger",
  "gltf",
  "log",
@@ -644,15 +645,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "dungeon-vr-client"
+name = "dungeon-vr-client-connection"
 version = "0.1.0"
 dependencies = [
  "dungeon-vr-cryptography",
+ "dungeon-vr-protocol",
  "dungeon-vr-shared",
+ "dungeon-vr-socket",
  "dungeon-vr-stream-codec",
+ "futures",
  "log",
  "tokio",
 ]
+
+[[package]]
+name = "dungeon-vr-client-session"
+version = "0.1.0"
 
 [[package]]
 name = "dungeon-vr-cryptography"
@@ -671,23 +679,48 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "dungeon-vr-server",
+ "dungeon-vr-server-connection",
+ "dungeon-vr-server-session",
  "env_logger",
  "log",
  "tokio",
 ]
 
 [[package]]
-name = "dungeon-vr-server"
+name = "dungeon-vr-protocol"
 version = "0.1.0"
 dependencies = [
  "dungeon-vr-cryptography",
+ "dungeon-vr-stream-codec",
+ "rand_core 0.5.1",
+ "thiserror",
+]
+
+[[package]]
+name = "dungeon-vr-server-connection"
+version = "0.1.0"
+dependencies = [
+ "dungeon-vr-cryptography",
+ "dungeon-vr-protocol",
  "dungeon-vr-shared",
  "dungeon-vr-socket",
  "dungeon-vr-stream-codec",
  "futures",
  "log",
- "pin-project",
+ "tokio",
+]
+
+[[package]]
+name = "dungeon-vr-server-session"
+version = "0.1.0"
+dependencies = [
+ "dungeon-vr-cryptography",
+ "dungeon-vr-server-connection",
+ "dungeon-vr-shared",
+ "dungeon-vr-socket",
+ "dungeon-vr-stream-codec",
+ "futures",
+ "log",
  "tokio",
 ]
 
@@ -695,15 +728,10 @@ dependencies = [
 name = "dungeon-vr-shared"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "bevy_ecs",
  "byteorder",
- "dungeon-vr-cryptography",
  "dungeon-vr-stream-codec",
- "pin-project",
- "rand_core 0.5.1",
  "rapier3d",
- "replace_with",
  "thiserror",
  "tokio",
 ]
@@ -720,12 +748,10 @@ dependencies = [
 name = "dungeon-vr-stream-codec"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "byteorder",
  "paste",
  "rapier3d",
  "thiserror",
- "x25519-dalek",
 ]
 
 [[package]]
@@ -1511,26 +1537,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c520e05135d6e763148b6426a837e239041653ba7becd2e538c076c738025fc"
 
 [[package]]
-name = "pin-project"
-version = "1.0.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78203e83c48cffbe01e4a2d35d566ca4de445d79a85372fc64e378bfc812a260"
-dependencies = [
- "pin-project-internal",
-]
-
-[[package]]
-name = "pin-project-internal"
-version = "1.0.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "710faf75e1b33345361201d36d04e98ac1ed8909151a017ed384700836104c74"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1699,12 +1705,6 @@ name = "regex-syntax"
 version = "0.6.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a3f87b73ce11b1619a3c6332f45341e0047173771e8b8b73f87bfeefb7b56244"
-
-[[package]]
-name = "replace_with"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3a8614ee435691de62bcffcf4a66d91b3594bf1428a5722e79103249a095690"
 
 [[package]]
 name = "robust"

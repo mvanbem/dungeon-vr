@@ -5,7 +5,7 @@ use byteorder::{ReadBytesExt, WriteBytesExt};
 use paste::paste;
 use thiserror::Error;
 
-use crate::{eof, ReadError, StreamCodec, O};
+use crate::{eof, ExternalStreamCodec, ReadError, StreamCodec, O};
 
 impl StreamCodec for () {
     type ReadError = Infallible;
@@ -113,3 +113,21 @@ impl_stream_codec_for_int!(u64);
 impl_stream_codec_for_int!(i16);
 impl_stream_codec_for_int!(i32);
 impl_stream_codec_for_int!(i64);
+
+pub enum UnframedByteVec {}
+
+impl ExternalStreamCodec for UnframedByteVec {
+    type Item = Vec<u8>;
+    type ReadError = Infallible;
+    type WriteError = Infallible;
+
+    fn read_from_ext(r: &mut &[u8]) -> Result<Vec<u8>, Infallible> {
+        let mut value = Vec::new();
+        r.read_to_end(&mut value).unwrap();
+        Ok(value)
+    }
+
+    fn write_to_ext(w: &mut Vec<u8>, value: &Vec<u8>) -> Result<(), Infallible> {
+        Ok(w.write_all(value).unwrap())
+    }
+}

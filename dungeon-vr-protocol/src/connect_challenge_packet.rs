@@ -3,12 +3,12 @@ use std::convert::Infallible;
 use dungeon_vr_cryptography::PublicKey;
 use dungeon_vr_stream_codec::StreamCodec;
 
-use crate::protocol::challenge_token::ChallengeToken;
-use crate::protocol::packet::ReadPacketError;
-use crate::protocol::sealed::Sealed;
+use crate::challenge_token::ChallengeToken;
+use crate::packet::ReadPacketError;
+use crate::sealed::Sealed;
 
 /// The server's response to a valid
-/// [`ConnectInitPacket`](crate::protocol::connect_init_packet::ConnectInitPacket).
+/// [`ConnectInitPacket`](crate::connect_init_packet::ConnectInitPacket).
 pub struct ConnectChallengePacket {
     /// The server's public key for ECDH key exchange.
     pub server_public_key: PublicKey,
@@ -41,9 +41,9 @@ mod tests {
     use dungeon_vr_cryptography::PrivateKey;
     use dungeon_vr_stream_codec::StreamCodec;
 
-    use crate::protocol::challenge_token::ChallengeToken;
-    use crate::protocol::packet::Packet;
-    use crate::protocol::sealed::Sealed;
+    use crate::challenge_token::ChallengeToken;
+    use crate::packet::Packet;
+    use crate::sealed::Sealed;
 
     use super::ConnectChallengePacket;
 

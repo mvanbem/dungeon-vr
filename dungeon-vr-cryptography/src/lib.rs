@@ -17,6 +17,7 @@ pub enum KeyExchangeError {
 #[error("error in authenticated decryption")]
 pub struct DecryptError;
 
+#[derive(Clone)]
 pub struct PrivateKey(x25519_dalek::ReusableSecret);
 
 impl Debug for PrivateKey {

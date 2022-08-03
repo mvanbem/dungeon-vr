@@ -7,6 +7,8 @@ mod std_impls;
 
 type O = byteorder::BigEndian;
 
+pub use crate::std_impls::UnframedByteVec;
+
 #[derive(Error, Debug)]
 pub enum ReadError {
     #[error("unexpected end of input")]
