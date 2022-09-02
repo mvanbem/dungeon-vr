@@ -1,5 +1,5 @@
 [package]
-name = "dungeon-vr-socket"
+name = "cancel"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
@@ -7,6 +7,4 @@ license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-async-trait = "0.1"
-futures = "0.3"
-tokio = { version = "1", features = ["net", "sync"] }
+tokio = { version = "1", features = ["sync"] }

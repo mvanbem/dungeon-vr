@@ -9,8 +9,8 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 clap = { version = "3", features = ["derive"] }
-dungeon-vr-server-connection = { path = "../dungeon-vr-server-connection" }
-dungeon-vr-server-session = { path = "../dungeon-vr-server-session" }
+dungeon-vr-connection-server = { path = "../dungeon-vr-connection-server" }
+dungeon-vr-session-server = { path = "../dungeon-vr-session-server" }
 env_logger = "0.9"
 log = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

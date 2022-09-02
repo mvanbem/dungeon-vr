@@ -11,7 +11,8 @@ use anyhow::Result;
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use clap::Parser;
-use dungeon_vr_client_connection::ClientConnection;
+use dungeon_vr_connection_client::ConnectionClient;
+use dungeon_vr_session_client::{Event as SessionEvent, SessionClient};
 use openxr as xr;
 use rapier3d::na as nalgebra;
 use rapier3d::na::{self, matrix, vector, Matrix4};
@@ -60,7 +61,7 @@ pub struct Args {
     #[clap(long)]
     vulkan_validation: bool,
 
-    /// Connects to a remote server at this address. Port 7777 if unspecified.
+    /// Connects to a remote server at this ip:port.
     #[clap(long)]
     connect: Option<String>,
 }
@@ -72,12 +73,18 @@ pub async fn main() -> Result<()> {
         .format_target(false)
         .init();
     let args = Args::parse();
-    if let Some(host) = &args.connect {
-        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?;
-        socket.connect(SocketAddr::from_str(host).unwrap()).await?;
-        let (cancel_guard, _requests, _events) = ClientConnection::spawn(socket);
-        forget(cancel_guard);
-    }
+    let mut session = match &args.connect {
+        Some(server_host) => {
+            let server_addr = SocketAddr::from_str(server_host).unwrap();
+            let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?;
+            let (cancel_guard, requests, events) =
+                ConnectionClient::spawn(Box::new(socket), server_addr);
+            let session = SessionClient::new(requests, events);
+            forget(cancel_guard);
+            Some(session)
+        }
+        None => None,
+    };
 
     let running = set_ctrlc_handler();
 
@@ -92,6 +99,7 @@ pub async fn main() -> Result<()> {
     let mut swapchain = None;
     main_loop(
         &args,
+        session.as_mut(),
         running,
         &vk,
         &xr,
@@ -161,6 +169,7 @@ fn frustum(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) ->
 
 fn main_loop<'a>(
     args: &Args,
+    mut session: Option<&mut SessionClient>,
     running: Arc<AtomicBool>,
     vk: &'a VkHandles,
     xr: &XrHandles,
@@ -171,6 +180,9 @@ fn main_loop<'a>(
     model_assets: &mut ModelAssets,
     game: &mut LocalGame,
 ) {
+    let netobj_model_key = model_assets.load(vk, render, material_assets, "error");
+    let mut latest_netobj_transform = None;
+
     let mut event_storage = xr::EventDataBuffer::new();
     let mut session_running = false;
     let mut frame = 0;
@@ -379,6 +391,16 @@ fn main_loop<'a>(
 
         // Step the game and extract rendering data.
         let models = game.update(vr_tracking);
+        // Also pull some state from the network session in a silly hacky way.
+        if let Some(session) = session.as_deref_mut() {
+            while let Some(event) = session.try_recv_event() {
+                match event {
+                    SessionEvent::GameState(mut game_state) => {
+                        latest_netobj_transform = Some(game_state.where_is_the_object())
+                    }
+                }
+            }
+        }
 
         // Group primitive instances.
         let mut transforms_by_primitive_by_material: HashMap<
@@ -394,6 +416,19 @@ fn main_loop<'a>(
                     .entry(RefEq(primitive))
                     .or_default()
                     .extend(transforms.clone());
+            }
+        }
+
+        // Append primitives from the network session.
+        if let Some(latest_netobj_transform) = latest_netobj_transform {
+            let netobj_model = model_assets.get(netobj_model_key);
+            for primitive in &netobj_model.primitives {
+                transforms_by_primitive_by_material
+                    .entry(primitive.material)
+                    .or_default()
+                    .entry(RefEq(primitive))
+                    .or_default()
+                    .push(latest_netobj_transform.to_matrix());
             }
         }
 

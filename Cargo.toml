@@ -1,14 +1,15 @@
 [workspace]
 members = [
+    "cancel",
     "dungeon-vr",
-    "dungeon-vr-client-connection",
-    "dungeon-vr-client-session",
+    "dungeon-vr-connection-client",
+    "dungeon-vr-connection-server",
+    "dungeon-vr-connection-shared",
     "dungeon-vr-cryptography",
     "dungeon-vr-dedicated",
-    "dungeon-vr-protocol",
-    "dungeon-vr-server-connection",
-    "dungeon-vr-server-session",
-    "dungeon-vr-shared",
+    "dungeon-vr-session-client",
+    "dungeon-vr-session-server",
+    "dungeon-vr-session-shared",
     "dungeon-vr-socket",
     "dungeon-vr-stream-codec",
 ]

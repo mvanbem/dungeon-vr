@@ -1,0 +1,17 @@
+[package]
+name = "dungeon-vr-connection-server"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+cancel = { path = "../cancel" }
+dungeon-vr-cryptography = { path = "../dungeon-vr-cryptography" }
+dungeon-vr-connection-shared = { path = "../dungeon-vr-connection-shared" }
+dungeon-vr-socket = { path = "../dungeon-vr-socket" }
+dungeon-vr-stream-codec = { path = "../dungeon-vr-stream-codec" }
+futures = "0.3"
+log = "0.4"
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "test-util", "time"] }

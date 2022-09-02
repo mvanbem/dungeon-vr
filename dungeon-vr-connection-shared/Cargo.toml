@@ -1,0 +1,13 @@
+[package]
+name = "dungeon-vr-connection-shared"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+dungeon-vr-cryptography = { path = "../dungeon-vr-cryptography" }
+dungeon-vr-stream-codec = { path = "../dungeon-vr-stream-codec" }
+rand_core = { version = "0.5", features = ["getrandom"] }
+thiserror = "1"

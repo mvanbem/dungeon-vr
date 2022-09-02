@@ -15,8 +15,8 @@ byteorder = "1"
 clap = { version = "3", features = ["derive"] }
 cstr = "0.2"
 ctrlc = "3"
-dungeon-vr-client-connection = { path = "../dungeon-vr-client-connection" }
-dungeon-vr-client-session = { path = "../dungeon-vr-client-session" }
+dungeon-vr-connection-client = { path = "../dungeon-vr-connection-client" }
+dungeon-vr-session-client = { path = "../dungeon-vr-session-client" }
 env_logger = "0.9"
 gltf = { version = "1", features = ["utils"] }
 log = "0.4"
