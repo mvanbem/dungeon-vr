@@ -398,6 +398,7 @@ fn main_loop<'a>(
                     SessionEvent::GameState(mut game_state) => {
                         latest_netobj_transform = Some(game_state.where_is_the_object())
                     }
+                    SessionEvent::Voice(_) => (),
                 }
             }
         }

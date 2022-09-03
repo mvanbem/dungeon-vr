@@ -8,6 +8,7 @@ use dungeon_vr_session_shared::net_game::{NetGame, NetGameFullCodec, PlayerId};
 use dungeon_vr_session_shared::packet::game_state_packet::GameStatePacket;
 use dungeon_vr_session_shared::packet::ping_packet::PingPacket;
 use dungeon_vr_session_shared::packet::pong_packet::PongPacket;
+use dungeon_vr_session_shared::packet::voice_packet::VoicePacket;
 use dungeon_vr_session_shared::packet::{Packet, TickId};
 use dungeon_vr_session_shared::time::ServerEpoch;
 use dungeon_vr_socket::AddrBound;
@@ -194,6 +195,7 @@ impl<Addr: AddrBound> InnerServer<Addr> {
         }
         match packet {
             Packet::Ping(packet) => self.handle_ping_packet(addr, packet).await,
+            Packet::Voice(packet) => self.handle_voice_packet(addr, packet).await,
             _ => {
                 log::error!("Unexpected game data packet: {:?}", packet.kind());
             }
@@ -210,6 +212,24 @@ impl<Addr: AddrBound> InnerServer<Addr> {
             }),
         )
         .await;
+    }
+
+    async fn handle_voice_packet(&mut self, addr: Addr, packet: VoicePacket) {
+        for player in self.players.iter().flatten() {
+            // Forward voice packets to all other players.
+            // TODO: Tag voice packets with player numbers so they can be reconstructed into
+            // separate streams.
+            if player.addr != addr {
+                send_game_data(
+                    &self.connection_requests,
+                    player.addr,
+                    Packet::Voice(VoicePacket {
+                        data: packet.data.clone(),
+                    }),
+                )
+                .await;
+            }
+        }
     }
 
     fn handle_connection_dropped(&mut self) {

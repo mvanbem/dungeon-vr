@@ -12,4 +12,5 @@ members = [
     "dungeon-vr-session-shared",
     "dungeon-vr-socket",
     "dungeon-vr-stream-codec",
+    "dungeon-vr-voip",
 ]

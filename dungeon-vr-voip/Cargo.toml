@@ -1,0 +1,20 @@
+[package]
+name = "dungeon-vr-voip"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1"
+cancel = { path = "../cancel" }
+clap = { version = "3", features = ["derive"] }
+cpal = "0.14"
+ctrlc = "3"
+dungeon-vr-connection-client = { path = "../dungeon-vr-connection-client" }
+dungeon-vr-session-client = { path = "../dungeon-vr-session-client" }
+env_logger = "0.9"
+log = "0.4"
+opus = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
