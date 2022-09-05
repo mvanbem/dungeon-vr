@@ -53,7 +53,7 @@ struct VrTrackingState {
 
 #[derive(Clone, Copy, Default)]
 pub struct VrTracking {
-    pub head: openxr::Posef,
+    pub view: openxr::Posef,
     pub hands: [VrHand; 2],
 }
 

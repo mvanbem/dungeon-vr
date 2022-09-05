@@ -14,6 +14,7 @@ pub struct XrSession<'a> {
     pub frame_stream: xr::FrameStream<xr::Vulkan>,
 
     pub stage: xr::Space,
+    pub view: xr::Space,
     pub action_set: xr::ActionSet,
     pub hands: [XrSessionHand<'a>; 2],
 }
@@ -44,6 +45,9 @@ impl<'a> XrSession<'a> {
         .unwrap();
         let stage = session
             .create_reference_space(xr::ReferenceSpaceType::STAGE, xr::Posef::IDENTITY)
+            .unwrap();
+        let view = session
+            .create_reference_space(xr::ReferenceSpaceType::VIEW, xr::Posef::IDENTITY)
             .unwrap();
         let action_set = xr
             .instance
@@ -85,6 +89,7 @@ impl<'a> XrSession<'a> {
             frame_stream,
 
             stage,
+            view,
             action_set,
             hands,
         }

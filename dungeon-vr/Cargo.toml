@@ -13,6 +13,7 @@ bevy_ecs = "0.7"
 bytemuck = { version = "1", features = ["derive"] }
 byteorder = "1"
 clap = { version = "3", features = ["derive"] }
+cpal = "0.14"
 cstr = "0.2"
 ctrlc = "3"
 dungeon-vr-connection-client = { path = "../dungeon-vr-connection-client" }
@@ -24,8 +25,10 @@ memoffset = "0.6"
 openxr = { version = "0.16", features = ["static"] }
 ordered-float = "3"
 png = "0.17"
+rand = "0.8"
 rapier3d = { version = "0.14", features = ["simd-stable"] }
 slotmap = "1"
+steam-audio-sys = { path = "../steam-audio-sys" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [build-dependencies]

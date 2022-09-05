@@ -14,12 +14,14 @@ use clap::Parser;
 use dungeon_vr_connection_client::ConnectionClient;
 use dungeon_vr_session_client::{Event as SessionEvent, SessionClient};
 use openxr as xr;
+use rand::Rng;
 use rapier3d::na as nalgebra;
 use rapier3d::na::{self, matrix, vector, Matrix4};
 use slotmap::Key;
 use tokio::net::UdpSocket;
 
 use crate::asset::{MaterialAssetKey, MaterialAssets, ModelAssets};
+use crate::audio::mixer::{Mixer, Sound};
 use crate::interop::xr_posef_to_na_isometry;
 use crate::local_game::{LocalGame, VrHand, VrTracking};
 use crate::model::Primitive;
@@ -30,6 +32,7 @@ use crate::xr_handles::XrHandles;
 use crate::xr_session::{XrSession, XrSessionHand};
 
 mod asset;
+mod audio;
 mod collider_cache;
 mod interop;
 mod local_game;
@@ -92,6 +95,20 @@ pub async fn main() -> Result<()> {
     let vk = VkHandles::new(&args, &xr);
     let mut xrs = XrSession::new(&xr, &vk);
     let render = RenderData::new(&vk);
+
+    let mixer = Mixer::new()?;
+    let sound = {
+        let mut samples = vec![0.0; 65536];
+        // let mut t = 0.0;
+        for sample in &mut samples {
+            // *sample = (std::f32::consts::TAU * 421.875 * t).sin() * 0.2;
+            // t += 1.0 / 48000.0;
+            *sample = rand::thread_rng().gen_range(-0.1..0.1);
+        }
+        Arc::new(Sound::from_samples(samples.into_boxed_slice()))
+    };
+    let _ = mixer.play(sound, 0, true, vector![0.0, 1.0, 0.0], 1.0);
+
     let mut material_assets = MaterialAssets::new(&vk, &render, &mut ());
     let mut model_assets = ModelAssets::new(&vk, &render, &mut material_assets);
     let mut game = LocalGame::new(&vk, &render, &mut material_assets, &mut model_assets);
@@ -105,6 +122,7 @@ pub async fn main() -> Result<()> {
         &xr,
         &mut xrs,
         &render,
+        &mixer,
         &mut swapchain,
         &mut material_assets,
         &mut model_assets,
@@ -175,6 +193,7 @@ fn main_loop<'a>(
     xr: &XrHandles,
     xrs: &mut XrSession,
     render: &RenderData,
+    mixer: &Mixer,
     swapchain: &mut Option<Swapchain<'a>>,
     material_assets: &mut MaterialAssets,
     model_assets: &mut ModelAssets,
@@ -355,6 +374,11 @@ fn main_loop<'a>(
         }
 
         // Read inputs.
+        let view_pose = xrs
+            .view
+            .locate(&xrs.stage, xr_frame_state.predicted_display_time)
+            .unwrap()
+            .pose;
         xrs.session
             .sync_actions(&[(&xrs.action_set).into()])
             .unwrap();
@@ -385,9 +409,12 @@ fn main_loop<'a>(
                 .current_state,
         };
         let vr_tracking = VrTracking {
-            head: xr::Posef::IDENTITY,
+            view: view_pose,
             hands: [capture_hand(&xrs.hands[0]), capture_hand(&xrs.hands[1])],
         };
+
+        // QUICK HACK: Tell the audio mixer about the latest view pose.
+        mixer.set_listener_transform(xr_posef_to_na_isometry(view_pose));
 
         // Step the game and extract rendering data.
         let models = game.update(vr_tracking);
