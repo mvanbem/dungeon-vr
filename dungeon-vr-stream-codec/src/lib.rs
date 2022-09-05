@@ -7,7 +7,7 @@ mod std_impls;
 
 type O = byteorder::BigEndian;
 
-pub use crate::std_impls::UnframedByteVec;
+pub use crate::std_impls::{ReadBoolError, ReadStringError, UnframedByteVec};
 
 #[derive(Error, Debug)]
 pub enum ReadError {

@@ -53,7 +53,7 @@ pub async fn main() -> Result<()> {
 
             event = session_events.recv() => if let Some(event) = event {
                 match event {
-                    SessionEvent::GameState(_) => (),
+                    SessionEvent::Snapshot(_) => (),
                     SessionEvent::Voice(data) => {
                         let _ = voice_to_speakers.try_send(data);
                     }

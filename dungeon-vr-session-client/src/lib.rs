@@ -4,14 +4,13 @@ use std::time::Duration;
 use dungeon_vr_connection_client::{
     ConnectionState, Event as ConnectionEvent, Request as ConnectionRequest,
 };
-use dungeon_vr_session_shared::net_game::{NetGame, NetGameFullCodec};
 use dungeon_vr_session_shared::packet::game_state_packet::GameStatePacket;
 use dungeon_vr_session_shared::packet::ping_packet::PingPacket;
 use dungeon_vr_session_shared::packet::pong_packet::PongPacket;
 use dungeon_vr_session_shared::packet::voice_packet::VoicePacket;
 use dungeon_vr_session_shared::packet::Packet;
 use dungeon_vr_session_shared::time::ClientEpoch;
-use dungeon_vr_stream_codec::{ExternalStreamCodec, StreamCodec};
+use dungeon_vr_stream_codec::StreamCodec;
 use futures::FutureExt;
 use tokio::select;
 use tokio::sync::mpsc;
@@ -82,7 +81,7 @@ struct InnerClient {
 }
 
 pub enum Event {
-    GameState(NetGame),
+    Snapshot(Vec<u8>),
     Voice(Vec<u8>),
 }
 
@@ -217,22 +216,10 @@ impl InnerClient {
     }
 
     async fn handle_game_state_packet(&mut self, packet: GameStatePacket) {
-        let mut r = packet.serialized_game_state.as_slice();
-        let game_state = match NetGameFullCodec::read_from_ext(&mut r) {
-            Ok(game_state) => game_state,
-            Err(e) => {
-                log::error!("Error decoding game state: {e}");
-                return;
-            }
-        };
-        if !r.is_empty() {
-            log::error!(
-                "Dropping game state: {} unexpected trailing byte(s)",
-                r.len(),
-            );
-            return;
-        }
-        let _ = self.events.send(Event::GameState(game_state)).await;
+        let _ = self
+            .events
+            .send(Event::Snapshot(packet.serialized_game_state))
+            .await;
     }
 
     async fn handle_voice_packet(&mut self, packet: VoicePacket) {

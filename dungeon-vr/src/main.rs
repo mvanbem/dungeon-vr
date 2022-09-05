@@ -14,16 +14,15 @@ use clap::Parser;
 use dungeon_vr_connection_client::ConnectionClient;
 use dungeon_vr_session_client::{Event as SessionEvent, SessionClient};
 use openxr as xr;
-use rand::Rng;
 use rapier3d::na as nalgebra;
 use rapier3d::na::{self, matrix, vector, Matrix4};
 use slotmap::Key;
 use tokio::net::UdpSocket;
 
 use crate::asset::{MaterialAssetKey, MaterialAssets, ModelAssets};
-use crate::audio::mixer::{Mixer, Sound};
+use crate::audio::mixer::Mixer;
+use crate::game::{Game, VrHand, VrTracking};
 use crate::interop::xr_posef_to_na_isometry;
-use crate::local_game::{LocalGame, VrHand, VrTracking};
 use crate::model::Primitive;
 use crate::render_data::RenderData;
 use crate::swapchain::Swapchain;
@@ -34,8 +33,8 @@ use crate::xr_session::{XrSession, XrSessionHand};
 mod asset;
 mod audio;
 mod collider_cache;
+mod game;
 mod interop;
-mod local_game;
 mod material;
 mod model;
 mod render_data;
@@ -95,23 +94,10 @@ pub async fn main() -> Result<()> {
     let vk = VkHandles::new(&args, &xr);
     let mut xrs = XrSession::new(&xr, &vk);
     let render = RenderData::new(&vk);
-
     let mixer = Mixer::new()?;
-    let sound = {
-        let mut samples = vec![0.0; 65536];
-        // let mut t = 0.0;
-        for sample in &mut samples {
-            // *sample = (std::f32::consts::TAU * 421.875 * t).sin() * 0.2;
-            // t += 1.0 / 48000.0;
-            *sample = rand::thread_rng().gen_range(-0.1..0.1);
-        }
-        Arc::new(Sound::from_samples(samples.into_boxed_slice()))
-    };
-    let _ = mixer.play(sound, 0, true, vector![0.0, 1.0, 0.0], 1.0);
-
     let mut material_assets = MaterialAssets::new(&vk, &render, &mut ());
     let mut model_assets = ModelAssets::new(&vk, &render, &mut material_assets);
-    let mut game = LocalGame::new(&vk, &render, &mut material_assets, &mut model_assets);
+    let mut game = Game::new(&vk, &render, &mut material_assets, &mut model_assets);
 
     let mut swapchain = None;
     main_loop(
@@ -197,11 +183,8 @@ fn main_loop<'a>(
     swapchain: &mut Option<Swapchain<'a>>,
     material_assets: &mut MaterialAssets,
     model_assets: &mut ModelAssets,
-    game: &mut LocalGame,
+    game: &mut Game,
 ) {
-    let netobj_model_key = model_assets.load(vk, render, material_assets, "error");
-    let mut latest_netobj_transform = None;
-
     let mut event_storage = xr::EventDataBuffer::new();
     let mut session_running = false;
     let mut frame = 0;
@@ -413,22 +396,19 @@ fn main_loop<'a>(
             hands: [capture_hand(&xrs.hands[0]), capture_hand(&xrs.hands[1])],
         };
 
-        // QUICK HACK: Tell the audio mixer about the latest view pose.
+        // Send the latest view pose to the audio mixer.
         mixer.set_listener_transform(xr_posef_to_na_isometry(view_pose));
 
         // Step the game and extract rendering data.
-        let models = game.update(vr_tracking);
-        // Also pull some state from the network session in a silly hacky way.
         if let Some(session) = session.as_deref_mut() {
             while let Some(event) = session.try_recv_event() {
                 match event {
-                    SessionEvent::GameState(mut game_state) => {
-                        latest_netobj_transform = Some(game_state.where_is_the_object())
-                    }
+                    SessionEvent::Snapshot(snapshot) => game.handle_snapshot(snapshot),
                     SessionEvent::Voice(_) => (),
                 }
             }
         }
+        let models = game.update(vk, render, material_assets, model_assets, vr_tracking);
 
         // Group primitive instances.
         let mut transforms_by_primitive_by_material: HashMap<
@@ -444,19 +424,6 @@ fn main_loop<'a>(
                     .entry(RefEq(primitive))
                     .or_default()
                     .extend(transforms.clone());
-            }
-        }
-
-        // Append primitives from the network session.
-        if let Some(latest_netobj_transform) = latest_netobj_transform {
-            let netobj_model = model_assets.get(netobj_model_key);
-            for primitive in &netobj_model.primitives {
-                transforms_by_primitive_by_material
-                    .entry(primitive.material)
-                    .or_default()
-                    .entry(RefEq(primitive))
-                    .or_default()
-                    .push(latest_netobj_transform.to_matrix());
             }
         }
 

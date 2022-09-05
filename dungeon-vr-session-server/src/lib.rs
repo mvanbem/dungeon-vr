@@ -1,10 +1,15 @@
-use std::collections::{hash_map, HashMap};
+use std::collections::{hash_map, BTreeMap, HashMap};
 use std::iter::repeat_with;
+use std::num::NonZeroU32;
 
+use bevy_ecs::prelude::*;
 use dungeon_vr_connection_server::{
     ConnectionState, Event as ConnectionEvent, Request as ConnectionRequest,
 };
-use dungeon_vr_session_shared::net_game::{NetGame, NetGameFullCodec, PlayerId};
+use dungeon_vr_session_shared::net_game::{
+    apply_inputs, write_snapshot, Authority, Input, ModelName, NetId, PlayerId, Replicated,
+    Transform,
+};
 use dungeon_vr_session_shared::packet::game_state_packet::GameStatePacket;
 use dungeon_vr_session_shared::packet::ping_packet::PingPacket;
 use dungeon_vr_session_shared::packet::pong_packet::PongPacket;
@@ -12,7 +17,9 @@ use dungeon_vr_session_shared::packet::voice_packet::VoicePacket;
 use dungeon_vr_session_shared::packet::{Packet, TickId};
 use dungeon_vr_session_shared::time::ServerEpoch;
 use dungeon_vr_socket::AddrBound;
-use dungeon_vr_stream_codec::{ExternalStreamCodec, StreamCodec};
+use dungeon_vr_stream_codec::StreamCodec;
+use rapier3d::na::{self as nalgebra, Unit, UnitQuaternion};
+use rapier3d::prelude::vector;
 use tokio::select;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Interval};
@@ -31,6 +38,25 @@ impl PlayerIdExt for PlayerId {
 
     fn from_index(index: usize) -> Self {
         Self(u8::try_from(index + 1).unwrap().try_into().unwrap())
+    }
+}
+
+#[derive(Clone)]
+pub struct NetIdAllocator {
+    next: NetId,
+}
+
+impl NetIdAllocator {
+    pub fn new() -> Self {
+        Self {
+            next: NetId(NonZeroU32::new(1).unwrap()),
+        }
+    }
+
+    pub fn next(&mut self) -> NetId {
+        let result = self.next;
+        self.next = NetId(self.next.0.checked_add(1).unwrap());
+        result
     }
 }
 
@@ -72,7 +98,9 @@ struct InnerServer<Addr> {
     clients: HashMap<Addr, ClientState>,
     players: Vec<Option<PlayerState<Addr>>>,
     epoch: ServerEpoch,
-    game: NetGame,
+    world: World,
+    tick_schedule: Schedule,
+    net_ids: NetIdAllocator,
     tick_interval: Interval,
     next_tick_id: TickId,
 }
@@ -85,6 +113,24 @@ struct PlayerState<Addr> {
     addr: Addr,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, StageLabel)]
+enum StageLabel {
+    ApplyInputs,
+    FlyAround,
+}
+
+#[derive(Component)]
+pub struct FliesAround;
+
+fn fly_around(mut query: Query<&mut Transform, With<FliesAround>>, tick_id: Res<TickId>) {
+    let t = tick_id.0 as f32 * 0.05; // arbitrary. TODO: Relate to real time.
+    for mut transform in query.iter_mut() {
+        transform.0.translation.vector = vector![0.0, 1.0, 0.0];
+        transform.0.rotation =
+            UnitQuaternion::from_axis_angle(&Unit::new_unchecked(vector![0.0, 1.0, 0.0]), t);
+    }
+}
+
 impl<Addr: AddrBound> InnerServer<Addr> {
     fn new(
         cancel_token: cancel::Token,
@@ -92,6 +138,27 @@ impl<Addr: AddrBound> InnerServer<Addr> {
         connection_events: mpsc::Receiver<ConnectionEvent<Addr>>,
         max_players: usize,
     ) -> Self {
+        let mut world = World::new();
+        let mut net_ids = NetIdAllocator::new();
+        let mut entities_by_net_id = BTreeMap::new();
+
+        let net_id = net_ids.next();
+        entities_by_net_id.insert(
+            net_id,
+            world
+                .spawn()
+                .insert_bundle(Replicated {
+                    net_id,
+                    authority: Authority::Server,
+                })
+                .insert(Transform::default())
+                .insert(ModelName("LowPolyDungeon/Sword".to_string()))
+                .insert(FliesAround)
+                .id(),
+        );
+
+        world.insert_resource(entities_by_net_id);
+
         Self {
             cancel_token,
             connection_requests,
@@ -99,7 +166,18 @@ impl<Addr: AddrBound> InnerServer<Addr> {
             clients: HashMap::new(),
             players: repeat_with(|| None).take(max_players).collect(),
             epoch: ServerEpoch::new(),
-            game: NetGame::new(),
+            world,
+            tick_schedule: Schedule::default()
+                .with_stage(
+                    StageLabel::ApplyInputs,
+                    SystemStage::parallel().with_system(apply_inputs),
+                )
+                .with_stage_after(
+                    StageLabel::ApplyInputs,
+                    StageLabel::FlyAround,
+                    SystemStage::parallel().with_system(fly_around),
+                ),
+            net_ids,
             tick_interval: interval(TICK_INTERVAL),
             next_tick_id: TickId(0),
         }
@@ -241,18 +319,24 @@ impl<Addr: AddrBound> InnerServer<Addr> {
 
         // Gather the current buffered inputs for this tick from each connection.
         // let player_inputs = self.players.iter().map(|x| x.buffered_input).collect();
-        self.game.update(std::collections::BTreeMap::default());
+        self.world.insert_resource(tick_id);
+        self.world
+            .insert_resource(BTreeMap::<PlayerId, Vec<Input>>::default());
+        self.tick_schedule.run(&mut self.world);
 
         // Send updates to all players.
+        let snapshot = {
+            let mut w = Vec::new();
+            write_snapshot(&mut w, &mut self.world).unwrap();
+            w
+        };
         for player in self.players.iter().flatten() {
-            let mut serialized_game_state = Vec::new();
-            NetGameFullCodec::write_to_ext(&mut serialized_game_state, &self.game).unwrap();
             send_game_data(
                 &self.connection_requests,
                 player.addr,
                 Packet::GameState(GameStatePacket {
                     tick_id,
-                    serialized_game_state,
+                    serialized_game_state: snapshot.clone(),
                 }),
             )
             .await;

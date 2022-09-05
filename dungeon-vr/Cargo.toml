@@ -18,6 +18,7 @@ cstr = "0.2"
 ctrlc = "3"
 dungeon-vr-connection-client = { path = "../dungeon-vr-connection-client" }
 dungeon-vr-session-client = { path = "../dungeon-vr-session-client" }
+dungeon-vr-session-shared = { path = "../dungeon-vr-session-shared" }
 env_logger = "0.9"
 gltf = { version = "1", features = ["utils"] }
 log = "0.4"
@@ -25,7 +26,6 @@ memoffset = "0.6"
 openxr = { version = "0.16", features = ["static"] }
 ordered-float = "3"
 png = "0.17"
-rand = "0.8"
 rapier3d = { version = "0.14", features = ["simd-stable"] }
 slotmap = "1"
 steam-audio-sys = { path = "../steam-audio-sys" }

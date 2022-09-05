@@ -7,6 +7,7 @@ license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+bevy_ecs = "0.7"
 cancel = { path = "../cancel" }
 dungeon-vr-connection-server = { path = "../dungeon-vr-connection-server" }
 dungeon-vr-cryptography = { path = "../dungeon-vr-cryptography" }
@@ -15,4 +16,5 @@ dungeon-vr-socket = { path = "../dungeon-vr-socket" }
 dungeon-vr-stream-codec = { path = "../dungeon-vr-stream-codec" }
 futures = "0.3"
 log = "0.4"
+rapier3d = { version = "0.14", features = ["simd-stable"] }
 tokio = { version = "1", features = ["macros", "net", "rt", "sync", "test-util", "time"] }

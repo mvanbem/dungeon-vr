@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
 use std::f32::consts::{FRAC_PI_2, PI};
+use std::mem::replace;
 
 use bevy_ecs::prelude::*;
+use dungeon_vr_session_shared::net_game::{apply_snapshot, ModelName, NetId, Transform};
 use ordered_float::NotNan;
 use rapier3d::na::{self, Isometry3, Matrix4, Translation, UnitQuaternion};
 use rapier3d::prelude::*;
@@ -10,15 +13,6 @@ use crate::asset::{MaterialAssets, ModelAssetKey, ModelAssets};
 use crate::collider_cache::{BorrowedColliderCacheKey, ColliderCache};
 use crate::render_data::RenderData;
 use crate::vk_handles::VkHandles;
-
-#[derive(Component)]
-struct Transform(Isometry3<f32>);
-
-impl Default for Transform {
-    fn default() -> Self {
-        Self(na::one())
-    }
-}
 
 #[derive(Component)]
 struct ModelRenderer {
@@ -64,10 +58,7 @@ pub struct VrHand {
     pub squeeze_force: f32,
 }
 
-#[derive(Default)]
-struct Models(SecondaryMap<ModelAssetKey, Vec<Matrix4<f32>>>);
-
-pub struct LocalGame {
+pub struct Game {
     world: World,
     schedule: Schedule,
     prev_vr_tracking: VrTracking,
@@ -86,7 +77,7 @@ struct GamePhysics {
     ccd_solver: CCDSolver,
 }
 
-impl LocalGame {
+impl Game {
     pub fn new(
         vk: &VkHandles,
         render: &RenderData,
@@ -222,6 +213,8 @@ impl LocalGame {
             multibody_joints: MultibodyJointSet::new(),
             ccd_solver: CCDSolver::new(),
         });
+        world.insert_resource(BTreeMap::<NetId, Entity>::default());
+        world.insert_resource(ModelTransforms::default());
 
         Self {
             world,
@@ -230,11 +223,22 @@ impl LocalGame {
         }
     }
 
+    pub fn handle_snapshot(&mut self, snapshot: Vec<u8>) {
+        let mut r = snapshot.as_slice();
+        apply_snapshot(&mut r, &mut self.world).unwrap();
+        assert!(r.is_empty());
+    }
+
     pub fn update(
         &mut self,
+        vk: &VkHandles,
+        render: &RenderData,
+        material_assets: &mut MaterialAssets,
+        model_assets: &mut ModelAssets,
         vr_tracking: VrTracking,
     ) -> SecondaryMap<ModelAssetKey, Vec<Matrix4<f32>>> {
-        self.world.insert_resource(Models::default());
+        self.load_models(vk, render, material_assets, model_assets);
+
         self.world.insert_resource(VrTrackingState {
             current: vr_tracking,
             prev: self.prev_vr_tracking,
@@ -243,7 +247,32 @@ impl LocalGame {
         self.schedule.run(&mut self.world);
 
         self.prev_vr_tracking = vr_tracking;
-        self.world.remove_resource::<Models>().unwrap().0
+        self.world.resource_mut::<ModelTransforms>().take()
+    }
+
+    fn load_models(
+        &mut self,
+        vk: &VkHandles,
+        render: &RenderData,
+        material_assets: &mut MaterialAssets,
+        model_assets: &mut ModelAssets,
+    ) {
+        let mut changes = Vec::new();
+        for (entity, model_name) in self
+            .world
+            .query_filtered::<(Entity, &ModelName), Without<ModelRenderer>>()
+            .iter_mut(&mut self.world)
+        {
+            changes.push((
+                entity,
+                model_assets.load(vk, render, material_assets, &model_name.0),
+            ));
+        }
+
+        for (entity, model_key) in changes {
+            let mut entity = self.world.entity_mut(entity);
+            entity.insert(ModelRenderer { model_key });
+        }
     }
 }
 
@@ -400,13 +429,28 @@ fn update_rigid_body_transforms(
     }
 }
 
-fn gather_models(query: Query<(&Transform, &ModelRenderer)>, mut models: ResMut<Models>) {
-    for (transform, model_renderer) in query.iter() {
-        models
-            .0
+#[derive(Default)]
+struct ModelTransforms(SecondaryMap<ModelAssetKey, Vec<Matrix4<f32>>>);
+
+impl ModelTransforms {
+    fn insert(&mut self, model_renderer: &ModelRenderer, transform: &Transform) {
+        self.0
             .entry(model_renderer.model_key)
             .unwrap()
             .or_default()
             .push(transform.0.to_matrix());
+    }
+
+    fn take(&mut self) -> SecondaryMap<ModelAssetKey, Vec<Matrix4<f32>>> {
+        replace(&mut self.0, Default::default())
+    }
+}
+
+fn gather_models(
+    query: Query<(&Transform, &ModelRenderer)>,
+    mut model_transforms: ResMut<ModelTransforms>,
+) {
+    for (transform, model_renderer) in query.iter() {
+        model_transforms.insert(model_renderer, transform);
     }
 }

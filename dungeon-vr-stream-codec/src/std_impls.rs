@@ -131,3 +131,50 @@ impl ExternalStreamCodec for UnframedByteVec {
         Ok(w.write_all(value).unwrap())
     }
 }
+
+#[derive(Error, Debug)]
+pub enum ReadStringError {
+    #[error("{0}")]
+    ReadError(#[from] ReadError),
+
+    #[error("invalid UTF-8")]
+    InvalidUtf8,
+}
+
+impl StreamCodec for String {
+    type ReadError = ReadStringError;
+    type WriteError = Infallible;
+
+    fn read_from(r: &mut &[u8]) -> Result<Self, ReadStringError> {
+        let len = u32::read_from(r)? as usize;
+        let mut buf = vec![0; len];
+        r.read_exact(&mut buf)
+            .map_err(|_| ReadError::UnexpectedEof)?;
+        let s = String::from_utf8(buf).map_err(|_| ReadStringError::InvalidUtf8)?;
+        Ok(s)
+    }
+
+    fn write_to(&self, w: &mut Vec<u8>) -> Result<(), Infallible> {
+        u32::try_from(self.len()).unwrap().write_to(w)?;
+        w.write_all(self.as_bytes()).unwrap();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::StreamCodec;
+
+    #[test]
+    fn write_string() {
+        let mut w = Vec::new();
+        "abc123".to_string().write_to(&mut w).unwrap();
+        assert_eq!(w.as_slice(), [0, 0, 0, 6, 97, 98, 99, 49, 50, 51]);
+    }
+
+    #[test]
+    fn read_string() {
+        let mut r = &[0, 0, 0, 6, 97, 98, 99, 49, 50, 51][..];
+        assert_eq!(String::read_from(&mut r).unwrap().as_str(), "abc123");
+    }
+}
