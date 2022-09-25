@@ -13,8 +13,9 @@ use crate::{ConnectionClient, ConnectionState, Event};
 async fn end_to_end() {
     run_test_with_timeout(async move {
         let network = FakeNetwork::new();
-        let (cancel_guard, _requests, mut events) =
-            ConnectionClient::spawn(Box::new(network.bind(FakeAddr::Client)), FakeAddr::Server);
+        let (cancel_guard, _requests, mut events) = ConnectionClient::spawn(Box::new(
+            network.connect(FakeAddr::Client, FakeAddr::Server),
+        ));
         let socket = network.bind(FakeAddr::Server);
 
         println!("Waiting for a ConnectInit packet");

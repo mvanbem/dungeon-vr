@@ -2,7 +2,8 @@ use std::convert::Infallible;
 
 use dungeon_vr_stream_codec::{ExternalStreamCodec, StreamCodec, UnframedByteVec};
 
-use crate::packet::{ReadPacketError, TickId};
+use crate::packet::ReadPacketError;
+use crate::TickId;
 
 pub struct GameStatePacket {
     pub tick_id: TickId,

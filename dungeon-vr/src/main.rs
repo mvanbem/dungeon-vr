@@ -13,6 +13,8 @@ use bytemuck::{Pod, Zeroable};
 use clap::Parser;
 use dungeon_vr_connection_client::ConnectionClient;
 use dungeon_vr_session_client::{Event as SessionEvent, SessionClient};
+use dungeon_vr_socket::fakelag::FakeLagConnectedSocket;
+use dungeon_vr_socket::ConnectedSocket;
 use openxr as xr;
 use rapier3d::na as nalgebra;
 use rapier3d::na::{self, matrix, vector, Matrix4};
@@ -32,7 +34,7 @@ use crate::xr_session::{XrSession, XrSessionHand};
 
 mod asset;
 mod audio;
-mod collider_cache;
+mod components;
 mod game;
 mod interop;
 mod material;
@@ -66,6 +68,11 @@ pub struct Args {
     /// Connects to a remote server at this ip:port.
     #[clap(long)]
     connect: Option<String>,
+
+    /// Adds exponentially distributed delay with the given mean to all incoming and outgoing
+    /// packets.
+    #[clap(long)]
+    fake_lag_ms: Option<u64>,
 }
 
 #[tokio::main]
@@ -78,9 +85,20 @@ pub async fn main() -> Result<()> {
     let mut session = match &args.connect {
         Some(server_host) => {
             let server_addr = SocketAddr::from_str(server_host).unwrap();
-            let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?;
-            let (cancel_guard, requests, events) =
-                ConnectionClient::spawn(Box::new(socket), server_addr);
+            let udp_socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?;
+            udp_socket.connect(server_addr).await?;
+
+            let socket: Box<dyn ConnectedSocket>;
+            if let Some(fake_lag_ms) = args.fake_lag_ms {
+                socket = Box::new(FakeLagConnectedSocket::new(
+                    udp_socket,
+                    Duration::from_millis(fake_lag_ms),
+                ));
+            } else {
+                socket = Box::new(udp_socket);
+            }
+
+            let (cancel_guard, requests, events) = ConnectionClient::spawn(socket);
             let session = SessionClient::new(requests, events);
             forget(cancel_guard);
             Some(session)
@@ -391,10 +409,10 @@ fn main_loop<'a>(
                 .unwrap()
                 .current_state,
         };
-        let vr_tracking = VrTracking {
+        game.set_vr_tracking(VrTracking {
             view: view_pose,
             hands: [capture_hand(&xrs.hands[0]), capture_hand(&xrs.hands[1])],
-        };
+        });
 
         // Send the latest view pose to the audio mixer.
         mixer.set_listener_transform(xr_posef_to_na_isometry(view_pose));
@@ -403,12 +421,17 @@ fn main_loop<'a>(
         if let Some(session) = session.as_deref_mut() {
             while let Some(event) = session.try_recv_event() {
                 match event {
-                    SessionEvent::Snapshot(snapshot) => game.handle_snapshot(snapshot),
+                    SessionEvent::Snapshot { tick_id, data } => game.handle_snapshot(tick_id, data),
                     SessionEvent::Voice(_) => (),
+                    SessionEvent::TimeSync {
+                        client_epoch,
+                        round_trip_time,
+                        offset,
+                    } => game.handle_time_sync(client_epoch, round_trip_time, offset),
                 }
             }
         }
-        let models = game.update(vk, render, material_assets, model_assets, vr_tracking);
+        let models = game.update(vk, render, material_assets, model_assets);
 
         // Group primitive instances.
         let mut transforms_by_primitive_by_material: HashMap<

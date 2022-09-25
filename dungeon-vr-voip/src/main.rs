@@ -30,8 +30,9 @@ pub async fn main() -> Result<()> {
 
     let server_addr = SocketAddr::from_str(&args.connect).unwrap();
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?;
+    socket.connect(server_addr).await?;
     let (_connection_cancel_guard, connection_requests, connection_events) =
-        ConnectionClient::spawn(Box::new(socket), server_addr);
+        ConnectionClient::spawn(Box::new(socket));
     let (_session_cancel_guard, mut session_events, session_requests) =
         SessionClient::new(connection_requests, connection_events).split();
 
@@ -53,10 +54,10 @@ pub async fn main() -> Result<()> {
 
             event = session_events.recv() => if let Some(event) = event {
                 match event {
-                    SessionEvent::Snapshot(_) => (),
                     SessionEvent::Voice(data) => {
                         let _ = voice_to_speakers.try_send(data);
                     }
+                    _ => (),
                 }
             },
         }

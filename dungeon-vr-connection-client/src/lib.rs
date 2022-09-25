@@ -9,7 +9,7 @@ use dungeon_vr_connection_shared::packet::Packet;
 use dungeon_vr_connection_shared::sealed::Sealed;
 use dungeon_vr_connection_shared::{GAME_ID, SAFE_RECV_BUFFER_SIZE};
 use dungeon_vr_cryptography::{KeyExchangeError, PrivateKey, PublicKey, SharedSecret};
-use dungeon_vr_socket::{AddrBound, BoundSocket};
+use dungeon_vr_socket::ConnectedSocket;
 use dungeon_vr_stream_codec::{StreamCodec, UnframedByteVec};
 use futures::FutureExt;
 use tokio::select;
@@ -32,9 +32,8 @@ pub enum Request {
     SendGameData(Vec<u8>),
 }
 
-pub struct ConnectionClient<Addr> {
-    socket: Box<dyn BoundSocket<Addr>>,
-    server_addr: Addr,
+pub struct ConnectionClient {
+    socket: Box<dyn ConnectedSocket>,
     requests: Option<mpsc::Receiver<Request>>,
     events: mpsc::Sender<Event>,
     recv_buffer: Pin<Box<[u8; SAFE_RECV_BUFFER_SIZE]>>,
@@ -42,10 +41,10 @@ pub struct ConnectionClient<Addr> {
     variant: Variant,
 }
 
-enum InternalEvent<Addr> {
+enum InternalEvent {
     Cancelled,
     Request(Option<Request>),
-    SocketRecv(io::Result<(usize, Addr)>),
+    SocketRecv(io::Result<usize>),
     ServerTimeout,
     SendIntervalElapsed,
     KeepaliveElapsed,
@@ -71,24 +70,22 @@ enum ConfirmConnectionResult {
     Unchanged,
 }
 
-impl<Addr: AddrBound> ConnectionClient<Addr> {
+impl ConnectionClient {
     pub fn spawn(
-        socket: Box<dyn BoundSocket<Addr>>,
-        server_addr: Addr,
+        socket: Box<dyn ConnectedSocket>,
     ) -> (cancel::Guard, mpsc::Sender<Request>, mpsc::Receiver<Event>) {
         let cancel_token = cancel::Token::new();
         let (requests_tx, requests_rx) = mpsc::channel(REQUEST_BUFFER_SIZE);
         let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER_SIZE);
 
-        let connection = Self::new(socket, server_addr, requests_rx, events_tx);
+        let connection = Self::new(socket, requests_rx, events_tx);
         tokio::spawn(connection.run(cancel_token.clone()));
 
         (cancel_token.guard(), requests_tx, events_rx)
     }
 
     fn new(
-        socket: Box<dyn BoundSocket<Addr>>,
-        server_addr: Addr,
+        socket: Box<dyn ConnectedSocket>,
         requests: mpsc::Receiver<Request>,
         events: mpsc::Sender<Event>,
     ) -> Self {
@@ -102,7 +99,6 @@ impl<Addr: AddrBound> ConnectionClient<Addr> {
         };
         Self {
             socket,
-            server_addr,
             requests: Some(requests),
             events,
             recv_buffer: Box::pin([0; SAFE_RECV_BUFFER_SIZE]),
@@ -129,7 +125,7 @@ impl<Addr: AddrBound> ConnectionClient<Addr> {
 
                 result = requests => InternalEvent::Request(result),
 
-                result = self.socket.recv_from(&mut self.recv_buffer[..]) => InternalEvent::SocketRecv(result),
+                result = self.socket.recv(&mut self.recv_buffer[..]) => InternalEvent::SocketRecv(result),
 
                 _ = timeout => InternalEvent::ServerTimeout,
 
@@ -143,9 +139,7 @@ impl<Addr: AddrBound> ConnectionClient<Addr> {
                 }
                 InternalEvent::Request(Some(request)) => self.handle_request(request).await,
                 InternalEvent::Request(None) => self.requests = None,
-                InternalEvent::SocketRecv(Ok((size, addr))) => {
-                    self.handle_socket_recv(size, addr).await
-                }
+                InternalEvent::SocketRecv(Ok(size)) => self.handle_socket_recv(size).await,
                 InternalEvent::SocketRecv(Err(_)) => {
                     // NOTE: Ignore any error. Windows in particular returns errors based on
                     // previous ICMP activity. These are not useful. If connectivity is disrupted,
@@ -199,18 +193,12 @@ impl<Addr: AddrBound> ConnectionClient<Addr> {
         };
         send_packet(
             &*self.socket,
-            self.server_addr,
             Packet::GameData(Sealed::seal_ext::<UnframedByteVec>(data, shared_secret)),
         )
         .await;
     }
 
-    async fn handle_socket_recv(&mut self, size: usize, addr: Addr) {
-        if addr != self.server_addr {
-            log::debug!("Discarding packet from unexpected address: {addr}");
-            return;
-        }
-
+    async fn handle_socket_recv(&mut self, size: usize) {
         let mut r = &self.recv_buffer[..size];
         let packet = match Packet::read_from(&mut r) {
             Ok(packet) => packet,
@@ -357,7 +345,6 @@ impl<Addr: AddrBound> ConnectionClient<Addr> {
             } => {
                 send_packet(
                     &*self.socket,
-                    self.server_addr,
                     Packet::ConnectInit(ConnectInitPacket {
                         game_id: GAME_ID,
                         client_public_key: *client_public_key,
@@ -372,7 +359,6 @@ impl<Addr: AddrBound> ConnectionClient<Addr> {
             } => {
                 send_packet(
                     &*self.socket,
-                    self.server_addr,
                     Packet::ConnectResponse(Sealed::seal(*token, shared_secret)),
                 )
                 .await;
@@ -385,7 +371,6 @@ impl<Addr: AddrBound> ConnectionClient<Addr> {
         let shared_secret = self.variant.shared_secret().unwrap();
         send_packet(
             &*self.socket,
-            self.server_addr,
             Packet::Keepalive(Sealed::seal((), shared_secret)),
         )
         .await;
@@ -426,13 +411,13 @@ impl<Addr: AddrBound> ConnectionClient<Addr> {
     }
 }
 
-async fn send_packet<Addr: AddrBound>(socket: &dyn BoundSocket<Addr>, addr: Addr, packet: Packet) {
+async fn send_packet(socket: &dyn ConnectedSocket, packet: Packet) {
     let mut w = Vec::new();
     packet.write_to(&mut w).unwrap();
     // NOTE: Ignore any error. Windows in particular returns errors based on previous ICMP activity.
     // These are not useful. If connectivity is disrupted, the timeout mechanism will eventually
     // notice.
-    _ = socket.send_to(&w, addr).await;
+    _ = socket.send(&w).await;
 }
 
 enum Variant {
@@ -466,7 +451,7 @@ impl Variant {
         }
     }
 
-    async fn event<Addr>(&mut self) -> InternalEvent<Addr> {
+    async fn event(&mut self) -> InternalEvent {
         let (send_interval, keepalive) = match self {
             Self::Disconnected { .. } => (pending().right_future(), pending().right_future()),
             Self::Connecting { send_interval, .. } => {

@@ -71,7 +71,7 @@ pub async fn send_packet(socket: &dyn BoundSocket<FakeAddr>, packet: Packet) {
 }
 
 fn make_network_and_connection(
-    mutate_connection: impl FnOnce(&mut ConnectionClient<FakeAddr>),
+    mutate_connection: impl FnOnce(&mut ConnectionClient),
 ) -> (
     FakeNetwork<FakeAddr>,
     cancel::Guard,
@@ -79,13 +79,12 @@ fn make_network_and_connection(
     mpsc::Receiver<Event>,
 ) {
     let network = FakeNetwork::new();
-    let socket = network.bind(FakeAddr::Client);
+    let socket = network.connect(FakeAddr::Client, FakeAddr::Server);
     let cancel_token = cancel::Token::new();
     let (request_tx, request_rx) = mpsc::channel(REQUEST_BUFFER_SIZE);
     let (event_tx, event_rx) = mpsc::channel(EVENT_BUFFER_SIZE);
 
-    let mut connection =
-        ConnectionClient::new(Box::new(socket), FakeAddr::Server, request_rx, event_tx);
+    let mut connection = ConnectionClient::new(Box::new(socket), request_rx, event_tx);
     mutate_connection(&mut connection);
     tokio::spawn(connection.run(cancel_token.clone()));
 

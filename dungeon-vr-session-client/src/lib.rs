@@ -9,7 +9,10 @@ use dungeon_vr_session_shared::packet::ping_packet::PingPacket;
 use dungeon_vr_session_shared::packet::pong_packet::PongPacket;
 use dungeon_vr_session_shared::packet::voice_packet::VoicePacket;
 use dungeon_vr_session_shared::packet::Packet;
-use dungeon_vr_session_shared::time::ClientEpoch;
+use dungeon_vr_session_shared::time::{
+    ClientEpoch, ClientOffset, ClientTimeToServerTime, LocalEpoch,
+};
+use dungeon_vr_session_shared::TickId;
 use dungeon_vr_stream_codec::StreamCodec;
 use futures::FutureExt;
 use tokio::select;
@@ -77,12 +80,21 @@ struct InnerClient {
     requests: mpsc::Receiver<Request>,
     epoch: ClientEpoch,
     time_sync: Option<Interval>,
+    round_trip_time: Option<f64>,
     client_time_to_server_time: Option<f64>,
 }
 
 pub enum Event {
-    Snapshot(Vec<u8>),
+    Snapshot {
+        tick_id: TickId,
+        data: Vec<u8>,
+    },
     Voice(Vec<u8>),
+    TimeSync {
+        client_epoch: ClientEpoch,
+        round_trip_time: ClientOffset,
+        offset: ClientTimeToServerTime,
+    },
 }
 
 pub enum Request {
@@ -103,8 +115,9 @@ impl InnerClient {
             connection_events,
             events,
             requests,
-            epoch: ClientEpoch::new(),
+            epoch: LocalEpoch::new(),
             time_sync: None,
+            round_trip_time: None,
             client_time_to_server_time: None,
         }
     }
@@ -187,7 +200,7 @@ impl InnerClient {
             return;
         }
         match packet {
-            Packet::Pong(packet) => self.handle_pong_packet(packet),
+            Packet::Pong(packet) => self.handle_pong_packet(packet).await,
             Packet::GameState(packet) => self.handle_game_state_packet(packet).await,
             Packet::Voice(packet) => self.handle_voice_packet(packet).await,
             _ => {
@@ -196,29 +209,60 @@ impl InnerClient {
         }
     }
 
-    fn handle_pong_packet(&mut self, packet: PongPacket) {
+    async fn handle_pong_packet(&mut self, packet: PongPacket) {
         let now = self.epoch.now();
-        let elapsed = now - packet.client_time;
-        let midpoint = packet.client_time + elapsed / 2;
+        let round_trip_time = now - packet.client_time;
+        self.round_trip_time = Some(match self.round_trip_time {
+            Some(prev) => {
+                let next = 0.9 * prev + 0.1 * round_trip_time.to_micros() as f64;
+                log::debug!("Time sync: Adjusting RTT from {prev} us to {next} us");
+                next
+            }
+            None => {
+                let next = round_trip_time.to_micros() as f64;
+                log::debug!("Time sync: Initial RTT is {next} us");
+                next
+            }
+        });
+
+        let midpoint = packet.client_time + round_trip_time / 2;
         let client_time_to_server_time = packet.server_time.to_micros_since_epoch() as f64
             - midpoint.to_micros_since_epoch() as f64;
         self.client_time_to_server_time = Some(match self.client_time_to_server_time {
             Some(prev) => {
                 let next = 0.9 * prev + 0.1 * client_time_to_server_time;
-                log::debug!("Time sync: Adjusting offset from {prev} to {next}");
+                log::debug!("Time sync: Adjusting offset from {prev} us to {next} us");
                 next
             }
             None => {
-                log::debug!("Time sync: Initial offset is {client_time_to_server_time}");
-                client_time_to_server_time
+                let next = client_time_to_server_time;
+                log::debug!("Time sync: Initial offset is {next} us");
+                next
             }
         });
+
+        let _ = self
+            .events
+            .send(Event::TimeSync {
+                client_epoch: self.epoch,
+                round_trip_time: ClientOffset::from_micros(
+                    self.round_trip_time.unwrap().round() as i64
+                ),
+                offset: ClientTimeToServerTime::from_micros(
+                    self.client_time_to_server_time.unwrap().round() as i64,
+                )
+                .into(),
+            })
+            .await;
     }
 
     async fn handle_game_state_packet(&mut self, packet: GameStatePacket) {
         let _ = self
             .events
-            .send(Event::Snapshot(packet.serialized_game_state))
+            .send(Event::Snapshot {
+                tick_id: packet.tick_id,
+                data: packet.serialized_game_state,
+            })
             .await;
     }
 

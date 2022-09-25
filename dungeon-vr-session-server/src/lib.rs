@@ -1,30 +1,37 @@
-use std::collections::{hash_map, BTreeMap, HashMap};
+use std::collections::{hash_map, HashMap};
+use std::f32::consts::FRAC_PI_2;
 use std::iter::repeat_with;
 use std::num::NonZeroU32;
+use std::pin::Pin;
 
 use bevy_ecs::prelude::*;
 use dungeon_vr_connection_server::{
     ConnectionState, Event as ConnectionEvent, Request as ConnectionRequest,
 };
-use dungeon_vr_session_shared::net_game::{
-    apply_inputs, write_snapshot, Authority, Input, ModelName, NetId, PlayerId, Replicated,
-    Transform,
-};
+use dungeon_vr_session_shared::action::apply_actions;
+use dungeon_vr_session_shared::collider_cache::{BorrowedColliderCacheKey, ColliderCache};
+use dungeon_vr_session_shared::components::interaction::Grabbable;
+use dungeon_vr_session_shared::components::net::{Authority, NetId, Replicated};
+use dungeon_vr_session_shared::components::physics::Physics;
+use dungeon_vr_session_shared::components::render::ModelName;
+use dungeon_vr_session_shared::components::spatial::{FliesAround, Transform};
 use dungeon_vr_session_shared::packet::game_state_packet::GameStatePacket;
 use dungeon_vr_session_shared::packet::ping_packet::PingPacket;
 use dungeon_vr_session_shared::packet::pong_packet::PongPacket;
 use dungeon_vr_session_shared::packet::voice_packet::VoicePacket;
-use dungeon_vr_session_shared::packet::{Packet, TickId};
-use dungeon_vr_session_shared::time::ServerEpoch;
+use dungeon_vr_session_shared::packet::Packet;
+use dungeon_vr_session_shared::resources::{AllActions, EntitiesByNetId};
+use dungeon_vr_session_shared::snapshot::write_snapshot;
+use dungeon_vr_session_shared::systems::fly_around;
+use dungeon_vr_session_shared::time::{LocalEpoch, ServerEpoch};
+use dungeon_vr_session_shared::{PlayerId, TickId};
 use dungeon_vr_socket::AddrBound;
 use dungeon_vr_stream_codec::StreamCodec;
-use rapier3d::na::{self as nalgebra, Unit, UnitQuaternion};
-use rapier3d::prelude::vector;
+use rapier3d::na::{self as nalgebra, vector, Isometry3, UnitQuaternion};
+use rapier3d::prelude::{ColliderSet, RigidBodyBuilder, RigidBodySet};
 use tokio::select;
 use tokio::sync::mpsc;
-use tokio::time::{interval, Duration, Interval};
-
-const TICK_INTERVAL: Duration = Duration::from_millis(50);
+use tokio::time::{sleep_until, Sleep};
 
 trait PlayerIdExt {
     fn index(self) -> usize;
@@ -101,8 +108,8 @@ struct InnerServer<Addr> {
     world: World,
     tick_schedule: Schedule,
     net_ids: NetIdAllocator,
-    tick_interval: Interval,
-    next_tick_id: TickId,
+    tick_sleep: Pin<Box<Sleep>>,
+    current_tick: TickId,
 }
 
 struct ClientState {
@@ -115,20 +122,13 @@ struct PlayerState<Addr> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, StageLabel)]
 enum StageLabel {
-    ApplyInputs,
-    FlyAround,
+    Singleton,
 }
 
-#[derive(Component)]
-pub struct FliesAround;
-
-fn fly_around(mut query: Query<&mut Transform, With<FliesAround>>, tick_id: Res<TickId>) {
-    let t = tick_id.0 as f32 * 0.05; // arbitrary. TODO: Relate to real time.
-    for mut transform in query.iter_mut() {
-        transform.0.translation.vector = vector![0.0, 1.0, 0.0];
-        transform.0.rotation =
-            UnitQuaternion::from_axis_angle(&Unit::new_unchecked(vector![0.0, 1.0, 0.0]), t);
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, SystemLabel)]
+enum SystemLabel {
+    CoreTick,
+    UpdateBeforePhysics,
 }
 
 impl<Addr: AddrBound> InnerServer<Addr> {
@@ -140,10 +140,49 @@ impl<Addr: AddrBound> InnerServer<Addr> {
     ) -> Self {
         let mut world = World::new();
         let mut net_ids = NetIdAllocator::new();
-        let mut entities_by_net_id = BTreeMap::new();
+        let mut entities_by_net_id = EntitiesByNetId::default();
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let mut collider_cache = ColliderCache::new();
 
+        // Spawn world geometry.
+        let mut spawn_context = SpawnContext {
+            world: &mut world,
+            colliders: &mut colliders,
+            collider_cache: &mut collider_cache,
+        };
+        spawn_context.spawn_static_model(
+            "LowPolyDungeon/Dungeon_Custom_Center",
+            vector![0.0, 0.0, 0.0].into(),
+        );
+        for side in 0..4 {
+            let rot = UnitQuaternion::from_scaled_axis(vector![0.0, FRAC_PI_2, 0.0] * side as f32);
+            spawn_context.spawn_static_model(
+                "LowPolyDungeon/Dungeon_Custom_Border_Flat",
+                Isometry3::from_parts((rot * vector![0.0, 0.0, -4.0]).into(), rot),
+            );
+            spawn_context.spawn_static_model(
+                "LowPolyDungeon/Dungeon_Wall_Var1",
+                Isometry3::from_parts((rot * vector![0.0, 0.0, -4.0]).into(), rot),
+            );
+
+            spawn_context.spawn_static_model(
+                "LowPolyDungeon/Dungeon_Custom_Corner_Flat",
+                Isometry3::from_parts((rot * vector![4.0, 0.0, 4.0]).into(), rot),
+            );
+            spawn_context.spawn_static_model(
+                "LowPolyDungeon/Dungeon_Wall_Var1",
+                Isometry3::from_parts((rot * vector![-4.0, 0.0, -4.0]).into(), rot),
+            );
+            spawn_context.spawn_static_model(
+                "LowPolyDungeon/Dungeon_Wall_Var1",
+                Isometry3::from_parts((rot * vector![4.0, 0.0, -4.0]).into(), rot),
+            );
+        }
+
+        // Spawn a rotating sword as a test object.
         let net_id = net_ids.next();
-        entities_by_net_id.insert(
+        entities_by_net_id.0.insert(
             net_id,
             world
                 .spawn()
@@ -157,29 +196,60 @@ impl<Addr: AddrBound> InnerServer<Addr> {
                 .id(),
         );
 
+        // Spawn a grabbable key.
+        let key_body = bodies.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(vector![0.0, 1.0, 0.0])
+                .ccd_enabled(true)
+                .build(),
+        );
+        let key_collider = colliders.insert_with_parent(
+            collider_cache.get(BorrowedColliderCacheKey::ConvexHull(
+                "LowPolyDungeon/Key_Silver",
+            )),
+            key_body,
+            &mut bodies,
+        );
+        world
+            .spawn()
+            .insert(Transform(vector![0.0, 1.0, 0.0].into()))
+            .insert(ModelName("LowPolyDungeon/Key_Silver".to_string()))
+            .insert(Grabbable { grabbed: false })
+            .insert(Physics {
+                collider: key_collider,
+                rigid_body: Some(key_body),
+            });
+
         world.insert_resource(entities_by_net_id);
 
+        let epoch = LocalEpoch::new();
         Self {
             cancel_token,
             connection_requests,
             connection_events,
             clients: HashMap::new(),
             players: repeat_with(|| None).take(max_players).collect(),
-            epoch: ServerEpoch::new(),
+            epoch,
             world,
-            tick_schedule: Schedule::default()
-                .with_stage(
-                    StageLabel::ApplyInputs,
-                    SystemStage::parallel().with_system(apply_inputs),
-                )
-                .with_stage_after(
-                    StageLabel::ApplyInputs,
-                    StageLabel::FlyAround,
-                    SystemStage::parallel().with_system(fly_around),
-                ),
+            tick_schedule: Schedule::default().with_stage(
+                StageLabel::Singleton,
+                SystemStage::parallel()
+                    .with_system_set(
+                        SystemSet::new()
+                            .label(SystemLabel::CoreTick)
+                            .with_system(apply_actions),
+                    )
+                    .with_system_set(
+                        SystemSet::new()
+                            .after(SystemLabel::CoreTick)
+                            .label(SystemLabel::UpdateBeforePhysics)
+                            .with_system(fly_around),
+                    ),
+            ),
             net_ids,
-            tick_interval: interval(TICK_INTERVAL),
-            next_tick_id: TickId(0),
+            // NOTE: This is early, but it only affects the very first tick.
+            tick_sleep: Box::pin(sleep_until(epoch.instant())),
+            current_tick: TickId(0),
         }
     }
 
@@ -190,7 +260,7 @@ impl<Addr: AddrBound> InnerServer<Addr> {
 
                 event = self.connection_events.recv() => Event::Connection(event),
 
-                _ = self.tick_interval.tick() => Event::Tick,
+                _ = self.tick_sleep.as_mut() => Event::Tick,
             };
 
             match event {
@@ -315,13 +385,12 @@ impl<Addr: AddrBound> InnerServer<Addr> {
     }
 
     async fn handle_tick(&mut self) {
-        let tick_id = self.take_next_tick_id();
+        self.current_tick = self.current_tick.next();
 
         // Gather the current buffered inputs for this tick from each connection.
         // let player_inputs = self.players.iter().map(|x| x.buffered_input).collect();
-        self.world.insert_resource(tick_id);
-        self.world
-            .insert_resource(BTreeMap::<PlayerId, Vec<Input>>::default());
+        self.world.insert_resource(self.current_tick);
+        self.world.insert_resource(AllActions::default());
         self.tick_schedule.run(&mut self.world);
 
         // Send updates to all players.
@@ -335,18 +404,16 @@ impl<Addr: AddrBound> InnerServer<Addr> {
                 &self.connection_requests,
                 player.addr,
                 Packet::GameState(GameStatePacket {
-                    tick_id,
+                    tick_id: self.current_tick,
                     serialized_game_state: snapshot.clone(),
                 }),
             )
             .await;
         }
-    }
 
-    fn take_next_tick_id(&mut self) -> TickId {
-        let tick_id = self.next_tick_id;
-        self.next_tick_id = TickId(self.next_tick_id.0 + 1);
-        tick_id
+        self.tick_sleep
+            .as_mut()
+            .reset(self.current_tick.next().goal_time().to_instant(self.epoch));
     }
 }
 
@@ -360,4 +427,26 @@ async fn send_game_data<Addr: AddrBound>(
     let _ = connection_requests
         .send(ConnectionRequest::SendGameData { addr, data })
         .await;
+}
+
+struct SpawnContext<'a> {
+    world: &'a mut World,
+    colliders: &'a mut ColliderSet,
+    collider_cache: &'a mut ColliderCache,
+}
+
+impl<'a> SpawnContext<'a> {
+    fn spawn_static_model(&mut self, name: &str, transform: Isometry3<f32>) {
+        self.world
+            .spawn()
+            .insert(Transform(transform))
+            .insert(ModelName(name.to_string()));
+        self.colliders.insert(
+            self.collider_cache
+                .get(BorrowedColliderCacheKey::TriangleMesh(&format!(
+                    "{name}_col"
+                )))
+                .position(transform),
+        );
+    }
 }
