@@ -12,15 +12,17 @@ use crate::time::ServerTime;
 
 pub mod action;
 pub mod collider_cache;
-pub mod components;
+pub mod core;
+pub mod fly_around;
+pub mod interaction;
 pub mod packet;
 pub mod physics;
+pub mod render;
 pub mod resources;
 pub mod snapshot;
-pub mod systems;
 pub mod time;
 
-pub const TICK_RATE: Duration = Duration::from_millis(50); // 20 Hz
+pub const TICK_INTERVAL: Duration = Duration::from_millis(50); // 20 Hz
 
 /// A small nonzero integer identifying a player currently connected to a game. A player's ID does
 /// not change while they are connected.
@@ -66,12 +68,12 @@ impl TickId {
     }
 
     pub fn latest_tick_for_time(time: ServerTime) -> Self {
-        const TICK_RATE_MICROS: u64 = TICK_RATE.as_micros() as u64;
-        Self((time.to_micros_since_epoch() / TICK_RATE_MICROS) as u32)
+        const TICK_INTERVAL_MICROS: u64 = TICK_INTERVAL.as_micros() as u64;
+        Self((time.to_micros_since_epoch() / TICK_INTERVAL_MICROS) as u32)
     }
 
     pub fn goal_time(self) -> ServerTime {
-        const TICK_RATE_MICROS: u64 = TICK_RATE.as_micros() as u64;
-        ServerTime::from_micros_since_epoch(self.0 as u64 * TICK_RATE_MICROS)
+        const TICK_INTERVAL_MICROS: u64 = TICK_INTERVAL.as_micros() as u64;
+        ServerTime::from_micros_since_epoch(self.0 as u64 * TICK_INTERVAL_MICROS)
     }
 }

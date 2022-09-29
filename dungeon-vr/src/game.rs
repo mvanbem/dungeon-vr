@@ -6,15 +6,13 @@ use std::num::NonZeroU8;
 use bevy_ecs::prelude::*;
 use dungeon_vr_session_shared::action::{apply_actions, Action};
 use dungeon_vr_session_shared::collider_cache::ColliderCache;
-use dungeon_vr_session_shared::components::interaction::{Grabbable, Hand, HandGrabState};
-use dungeon_vr_session_shared::components::net::NetId;
-use dungeon_vr_session_shared::components::physics::Physics;
-use dungeon_vr_session_shared::components::render::ModelName;
-use dungeon_vr_session_shared::components::spatial::Transform;
-use dungeon_vr_session_shared::physics::GamePhysics;
+use dungeon_vr_session_shared::core::{Synchronized, TransformComponent};
+use dungeon_vr_session_shared::fly_around::fly_around;
+use dungeon_vr_session_shared::interaction::{GrabbableComponent, HandComponent, HandGrabState};
+use dungeon_vr_session_shared::physics::{sync_physics, PhysicsComponent, PhysicsResource};
+use dungeon_vr_session_shared::render::{ModelHandle, RenderComponent};
 use dungeon_vr_session_shared::resources::{AllActions, EntitiesByNetId};
 use dungeon_vr_session_shared::snapshot::apply_snapshot;
-use dungeon_vr_session_shared::systems::fly_around;
 use dungeon_vr_session_shared::time::{ClientEpoch, ClientOffset, ClientTimeToServerTime};
 use dungeon_vr_session_shared::{PlayerId, TickId};
 use ordered_float::NotNan;
@@ -22,8 +20,7 @@ use rapier3d::na::{self, Isometry3, Matrix4, Translation, UnitQuaternion};
 use rapier3d::prelude::*;
 use slotmap::SecondaryMap;
 
-use crate::asset::{MaterialAssets, ModelAssetKey, ModelAssets};
-use crate::components::ModelRenderer;
+use crate::asset::{MaterialAssets, ModelAssets};
 use crate::render_data::RenderData;
 use crate::vk_handles::VkHandles;
 
@@ -96,30 +93,19 @@ enum SystemLabel {
 }
 
 impl Game {
-    pub fn new(
-        vk: &VkHandles,
-        render: &RenderData,
-        material_assets: &mut MaterialAssets,
-        model_assets: &mut ModelAssets,
-    ) -> Self {
+    pub fn new() -> Self {
         let mut world = World::new();
         let bodies = RigidBodySet::new();
         let colliders = ColliderSet::new();
         let collider_cache = ColliderCache::new();
 
+        // TODO: The server will need to spawn these in order to assign net IDs.
         for index in 0..2 {
             world
                 .spawn()
-                .insert(Transform::default())
-                .insert(ModelRenderer {
-                    model_key: model_assets.load(
-                        vk,
-                        render,
-                        material_assets,
-                        ["left_hand", "right_hand"][index],
-                    ),
-                })
-                .insert(Hand {
+                .insert(TransformComponent::default())
+                .insert(RenderComponent::new(["left_hand", "right_hand"][index]))
+                .insert(HandComponent {
                     index,
                     grab_state: HandGrabState::Empty,
                 });
@@ -143,7 +129,8 @@ impl Game {
                 .with_system_set(
                     SystemSet::new()
                         .label(SystemLabel::Init)
-                        .with_system(reset_forces),
+                        .with_system(reset_forces)
+                        .with_system(sync_physics),
                 )
                 .with_system_set(
                     SystemSet::new()
@@ -171,22 +158,12 @@ impl Game {
                 ),
         );
 
-        world.insert_resource(GamePhysics {
+        world.insert_resource(PhysicsResource::new(
             bodies,
             colliders,
             collider_cache,
-            integration_parameters: IntegrationParameters {
-                dt: 1.0 / 120.0,
-                ..Default::default()
-            },
-            physics_pipeline: PhysicsPipeline::new(),
-            islands: IslandManager::new(),
-            broad_phase: BroadPhase::new(),
-            narrow_phase: NarrowPhase::new(),
-            impulse_joints: ImpulseJointSet::new(),
-            multibody_joints: MultibodyJointSet::new(),
-            ccd_solver: CCDSolver::new(),
-        });
+            1.0 / 120.0,
+        ));
         world.insert_resource(EntitiesByNetId::default());
         world.insert_resource(ModelTransforms::default());
 
@@ -248,7 +225,7 @@ impl Game {
         render: &RenderData,
         material_assets: &mut MaterialAssets,
         model_assets: &mut ModelAssets,
-    ) -> SecondaryMap<ModelAssetKey, Vec<Matrix4<f32>>> {
+    ) -> SecondaryMap<ModelHandle, Vec<Matrix4<f32>>> {
         self.ecs
             .load_models(vk, render, material_assets, model_assets);
 
@@ -329,35 +306,27 @@ impl GameEcs {
         material_assets: &mut MaterialAssets,
         model_assets: &mut ModelAssets,
     ) {
-        let mut changes = Vec::new();
-        for (entity, model_name) in self
+        for mut model in self
             .world
-            .query_filtered::<(Entity, &ModelName), Without<ModelRenderer>>()
+            .query::<&mut RenderComponent>()
             .iter_mut(&mut self.world)
         {
-            changes.push((
-                entity,
-                model_assets.load(vk, render, material_assets, &model_name.0),
-            ));
-        }
-
-        for (entity, model_key) in changes {
-            let mut entity = self.world.entity_mut(entity);
-            entity.insert(ModelRenderer { model_key });
+            // TODO: Only if changed?
+            model.model_handle = model_assets.load(vk, render, material_assets, &model.model_name);
         }
     }
 }
 
-fn reset_forces(mut physics: ResMut<GamePhysics>) {
+fn reset_forces(mut physics: ResMut<PhysicsResource>) {
     for (_, body) in physics.bodies.iter_mut() {
         body.reset_forces(false);
     }
 }
 
 fn emit_hand_actions(
-    query: Query<(&Transform, &Hand), Without<Grabbable>>,
+    query: Query<(&TransformComponent, &HandComponent), Without<GrabbableComponent>>,
     vr_tracking: Res<VrTrackingState>,
-    grabbable_query: Query<(&NetId, &Transform, &Grabbable)>,
+    grabbable_query: Query<(&Synchronized, &TransformComponent, &GrabbableComponent)>,
     mut local_actions: ResMut<LocalActions>,
 ) {
     for (transform, hand) in query.iter() {
@@ -370,7 +339,7 @@ fn emit_hand_actions(
                 if vr_hand.squeeze_force > 0.2 && prev_vr_hand.squeeze_force <= 0.2 {
                     if let Some((_dist, net_id)) = grabbable_query
                         .iter()
-                        .filter_map(|(net_id, grabbable_transform, grabbable)| {
+                        .filter_map(|(synchronized, grabbable_transform, grabbable)| {
                             if grabbable.grabbed {
                                 return None;
                             }
@@ -378,7 +347,7 @@ fn emit_hand_actions(
                                 - transform.0.translation.vector)
                                 .magnitude();
                             if dist <= 0.1 {
-                                Some((dist, *net_id))
+                                Some((dist, synchronized.net_id))
                             } else {
                                 None
                             }
@@ -404,11 +373,11 @@ fn emit_hand_actions(
 }
 
 fn update_hands(
-    mut query: Query<(&mut Transform, &Hand), Without<Grabbable>>,
+    mut query: Query<(&mut TransformComponent, &HandComponent), Without<GrabbableComponent>>,
     vr_tracking: Res<VrTrackingState>,
     entities_by_net_id: Res<EntitiesByNetId>,
-    mut physics: ResMut<GamePhysics>,
-    grabbable_query: Query<&Physics, With<Grabbable>>,
+    mut physics: ResMut<PhysicsResource>,
+    grabbable_query: Query<&PhysicsComponent, With<GrabbableComponent>>,
 ) {
     for (mut transform, hand) in query.iter_mut() {
         let vr_hand = &vr_tracking.current.hands[hand.index];
@@ -444,8 +413,8 @@ fn update_hands(
     }
 }
 
-fn physics_step(mut physics: ResMut<GamePhysics>) {
-    let GamePhysics {
+fn physics_step(mut physics: ResMut<PhysicsResource>) {
+    let PhysicsResource {
         bodies,
         colliders,
         integration_parameters,
@@ -475,8 +444,8 @@ fn physics_step(mut physics: ResMut<GamePhysics>) {
 }
 
 fn update_rigid_body_transforms(
-    mut query: Query<(&mut Transform, &Physics)>,
-    game_physics: Res<GamePhysics>,
+    mut query: Query<(&mut TransformComponent, &PhysicsComponent)>,
+    game_physics: Res<PhysicsResource>,
 ) {
     for (mut transform, physics) in query.iter_mut() {
         if let Some(handle) = physics.rigid_body {
@@ -487,12 +456,12 @@ fn update_rigid_body_transforms(
 }
 
 #[derive(Default)]
-struct ModelTransforms(SecondaryMap<ModelAssetKey, Vec<Matrix4<f32>>>);
+struct ModelTransforms(SecondaryMap<ModelHandle, Vec<Matrix4<f32>>>);
 
 impl ModelTransforms {
-    fn insert(&mut self, model_renderer: &ModelRenderer, transform: &Transform) {
+    fn insert(&mut self, model: &RenderComponent, transform: &TransformComponent) {
         self.0
-            .entry(model_renderer.model_key)
+            .entry(model.model_handle)
             .unwrap()
             .or_default()
             .push(transform.0.to_matrix());
@@ -500,10 +469,10 @@ impl ModelTransforms {
 }
 
 fn gather_models(
-    query: Query<(&Transform, &ModelRenderer)>,
+    query: Query<(&TransformComponent, &RenderComponent)>,
     mut model_transforms: ResMut<ModelTransforms>,
 ) {
-    for (transform, model_renderer) in query.iter() {
-        model_transforms.insert(model_renderer, transform);
+    for (transform, model) in query.iter() {
+        model_transforms.insert(model, transform);
     }
 }

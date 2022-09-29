@@ -9,26 +9,26 @@ use dungeon_vr_connection_server::{
     ConnectionState, Event as ConnectionEvent, Request as ConnectionRequest,
 };
 use dungeon_vr_session_shared::action::apply_actions;
-use dungeon_vr_session_shared::collider_cache::{BorrowedColliderCacheKey, ColliderCache};
-use dungeon_vr_session_shared::components::interaction::Grabbable;
-use dungeon_vr_session_shared::components::net::{Authority, NetId, Replicated};
-use dungeon_vr_session_shared::components::physics::Physics;
-use dungeon_vr_session_shared::components::render::ModelName;
-use dungeon_vr_session_shared::components::spatial::{FliesAround, Transform};
+use dungeon_vr_session_shared::collider_cache::ColliderCache;
+use dungeon_vr_session_shared::core::{Authority, NetId, Synchronized, TransformComponent};
+use dungeon_vr_session_shared::fly_around::fly_around;
+use dungeon_vr_session_shared::fly_around::FlyAroundComponent;
+use dungeon_vr_session_shared::interaction::GrabbableComponent;
 use dungeon_vr_session_shared::packet::game_state_packet::GameStatePacket;
 use dungeon_vr_session_shared::packet::ping_packet::PingPacket;
 use dungeon_vr_session_shared::packet::pong_packet::PongPacket;
 use dungeon_vr_session_shared::packet::voice_packet::VoicePacket;
 use dungeon_vr_session_shared::packet::Packet;
+use dungeon_vr_session_shared::physics::{PhysicsComponent, PhysicsResource};
+use dungeon_vr_session_shared::render::RenderComponent;
 use dungeon_vr_session_shared::resources::{AllActions, EntitiesByNetId};
 use dungeon_vr_session_shared::snapshot::write_snapshot;
-use dungeon_vr_session_shared::systems::fly_around;
 use dungeon_vr_session_shared::time::{LocalEpoch, ServerEpoch};
-use dungeon_vr_session_shared::{PlayerId, TickId};
+use dungeon_vr_session_shared::{PlayerId, TickId, TICK_INTERVAL};
 use dungeon_vr_socket::AddrBound;
 use dungeon_vr_stream_codec::StreamCodec;
 use rapier3d::na::{self as nalgebra, vector, Isometry3, UnitQuaternion};
-use rapier3d::prelude::{ColliderSet, RigidBodyBuilder, RigidBodySet};
+use rapier3d::prelude::{ColliderSet, RigidBodySet};
 use tokio::select;
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Sleep};
@@ -141,15 +141,11 @@ impl<Addr: AddrBound> InnerServer<Addr> {
         let mut world = World::new();
         let mut net_ids = NetIdAllocator::new();
         let mut entities_by_net_id = EntitiesByNetId::default();
-        let mut bodies = RigidBodySet::new();
-        let mut colliders = ColliderSet::new();
-        let mut collider_cache = ColliderCache::new();
 
         // Spawn world geometry.
         let mut spawn_context = SpawnContext {
             world: &mut world,
-            colliders: &mut colliders,
-            collider_cache: &mut collider_cache,
+            net_ids: &mut net_ids,
         };
         spawn_context.spawn_static_model(
             "LowPolyDungeon/Dungeon_Custom_Center",
@@ -186,40 +182,33 @@ impl<Addr: AddrBound> InnerServer<Addr> {
             net_id,
             world
                 .spawn()
-                .insert_bundle(Replicated {
-                    net_id,
-                    authority: Authority::Server,
-                })
-                .insert(Transform::default())
-                .insert(ModelName("LowPolyDungeon/Sword".to_string()))
-                .insert(FliesAround)
+                .insert(Synchronized { net_id })
+                .insert(Authority::Server)
+                .insert(TransformComponent::default())
+                .insert(RenderComponent::new("LowPolyDungeon/Sword"))
+                .insert(FlyAroundComponent)
                 .id(),
         );
 
         // Spawn a grabbable key.
-        let key_body = bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .translation(vector![0.0, 1.0, 0.0])
-                .ccd_enabled(true)
-                .build(),
-        );
-        let key_collider = colliders.insert_with_parent(
-            collider_cache.get(BorrowedColliderCacheKey::ConvexHull(
-                "LowPolyDungeon/Key_Silver",
-            )),
-            key_body,
-            &mut bodies,
-        );
+        let net_id = net_ids.next();
         world
             .spawn()
-            .insert(Transform(vector![0.0, 1.0, 0.0].into()))
-            .insert(ModelName("LowPolyDungeon/Key_Silver".to_string()))
-            .insert(Grabbable { grabbed: false })
-            .insert(Physics {
-                collider: key_collider,
-                rigid_body: Some(key_body),
-            });
+            .insert(Synchronized { net_id })
+            .insert(Authority::Server)
+            .insert(TransformComponent(vector![0.0, 1.0, 0.0].into()))
+            .insert(RenderComponent::new("LowPolyDungeon/Key_Silver"))
+            .insert(GrabbableComponent { grabbed: false })
+            .insert(PhysicsComponent::new_dynamic_ccd(
+                "LowPolyDungeon/Key_Silver",
+            ));
 
+        world.insert_resource(PhysicsResource::new(
+            RigidBodySet::new(),
+            ColliderSet::new(),
+            ColliderCache::new(),
+            TICK_INTERVAL.as_secs_f32(),
+        ));
         world.insert_resource(entities_by_net_id);
 
         let epoch = LocalEpoch::new();
@@ -431,22 +420,17 @@ async fn send_game_data<Addr: AddrBound>(
 
 struct SpawnContext<'a> {
     world: &'a mut World,
-    colliders: &'a mut ColliderSet,
-    collider_cache: &'a mut ColliderCache,
+    net_ids: &'a mut NetIdAllocator,
 }
 
 impl<'a> SpawnContext<'a> {
     fn spawn_static_model(&mut self, name: &str, transform: Isometry3<f32>) {
+        let net_id = self.net_ids.next();
         self.world
             .spawn()
-            .insert(Transform(transform))
-            .insert(ModelName(name.to_string()));
-        self.colliders.insert(
-            self.collider_cache
-                .get(BorrowedColliderCacheKey::TriangleMesh(&format!(
-                    "{name}_col"
-                )))
-                .position(transform),
-        );
+            .insert(Synchronized { net_id })
+            .insert(TransformComponent(transform))
+            .insert(RenderComponent::new(name))
+            .insert(PhysicsComponent::new_static(format!("{name}_col")));
     }
 }

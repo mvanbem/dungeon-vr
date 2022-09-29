@@ -6,7 +6,7 @@ use bytemuck::{Pod, Zeroable};
 use gltf::mesh::util::{ReadIndices, ReadTexCoords};
 use slotmap::Key;
 
-use crate::asset::{Asset, Loader, MaterialAssetKey, MaterialAssets};
+use crate::asset::{Asset, Loader, MaterialAssets, MaterialHandle};
 use crate::render_data::RenderData;
 use crate::vk_handles::VkHandles;
 
@@ -30,7 +30,7 @@ pub struct Primitive {
     pub vertex_memory: vk::DeviceMemory,
     pub index_buffer: vk::Buffer,
     pub index_memory: vk::DeviceMemory,
-    pub material: MaterialAssetKey,
+    pub material: MaterialHandle,
 }
 
 impl Loader for Model {
@@ -121,7 +121,7 @@ impl Loader for Model {
                         ctx.load(vk, render, &mut (), path.to_str().unwrap())
                     }
                 },
-                None => MaterialAssetKey::null(),
+                None => MaterialHandle::null(),
             };
 
             primitives.push(Primitive {

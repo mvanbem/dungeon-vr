@@ -914,6 +914,7 @@ dependencies = [
  "futures",
  "log",
  "rapier3d",
+ "slotmap",
  "tokio",
 ]
 
@@ -927,6 +928,7 @@ dependencies = [
  "gltf",
  "log",
  "rapier3d",
+ "slotmap",
  "thiserror",
  "tokio",
 ]

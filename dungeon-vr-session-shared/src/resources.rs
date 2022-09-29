@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use bevy_ecs::prelude::*;
 
 use crate::action::Action;
-use crate::components::net::NetId;
+use crate::core::NetId;
 use crate::PlayerId;
 
 #[derive(Default)]

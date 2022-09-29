@@ -4,6 +4,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 
 use anyhow::Result;
+use dungeon_vr_session_shared::render::ModelHandle;
 use slotmap::{new_key_type, SlotMap};
 
 use crate::material::Material;
@@ -11,11 +12,10 @@ use crate::model::Model;
 use crate::render_data::RenderData;
 use crate::vk_handles::VkHandles;
 
-new_key_type! { pub struct MaterialAssetKey; }
-pub type MaterialAssets = Assets<Material, MaterialAssetKey>;
+new_key_type! { pub struct MaterialHandle; }
+pub type MaterialAssets = Assets<Material, MaterialHandle>;
 
-new_key_type! { pub struct ModelAssetKey; }
-pub type ModelAssets = Assets<Model, ModelAssetKey>;
+pub type ModelAssets = Assets<Model, ModelHandle>;
 
 pub trait Asset {
     unsafe fn destroy(self, vk: &VkHandles, render: &RenderData);

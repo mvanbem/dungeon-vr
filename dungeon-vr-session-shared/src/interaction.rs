@@ -1,9 +1,9 @@
 use bevy_ecs::prelude::*;
 
-use crate::components::net::NetId;
+use crate::core::NetId;
 
 #[derive(Component)]
-pub struct Hand {
+pub struct HandComponent {
     pub index: usize,
     pub grab_state: HandGrabState,
 }
@@ -24,6 +24,6 @@ impl HandGrabState {
 }
 
 #[derive(Component)]
-pub struct Grabbable {
+pub struct GrabbableComponent {
     pub grabbed: bool,
 }

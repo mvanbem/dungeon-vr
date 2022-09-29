@@ -1,9 +1,12 @@
 use bevy_ecs::prelude::*;
 use rapier3d::na::{self as nalgebra, vector, Unit, UnitQuaternion};
 
-use crate::components::spatial::{FliesAround, Transform};
+use crate::core::TransformComponent;
 
-pub fn fly_around(mut query: Query<&mut Transform, With<FliesAround>>) {
+#[derive(Component)]
+pub struct FlyAroundComponent;
+
+pub fn fly_around(mut query: Query<&mut TransformComponent, With<FlyAroundComponent>>) {
     const DT: f32 = 1.0 / 20.0;
     for mut transform in query.iter_mut() {
         transform.0.translation.vector = vector![0.0, 1.0, 0.0];

@@ -4,8 +4,8 @@ use bevy_ecs::prelude::*;
 use dungeon_vr_stream_codec::{ReadError, StreamCodec};
 use thiserror::Error;
 
-use crate::components::interaction::{Grabbable, Hand, HandGrabState};
-use crate::components::net::{Authority, NetId, ReadNetIdError};
+use crate::core::{Authority, NetId, ReadNetIdError};
+use crate::interaction::{GrabbableComponent, HandComponent, HandGrabState};
 use crate::resources::{AllActions, EntitiesByNetId};
 use crate::PlayerId;
 
@@ -65,8 +65,8 @@ impl StreamCodec for Action {
 
 pub fn apply_actions(
     actions: Res<AllActions>,
-    mut hand_query: Query<(&Authority, &mut Hand), Without<Grabbable>>,
-    mut grabbable_query: Query<(&mut Authority, &mut Grabbable), Without<Hand>>,
+    mut hand_query: Query<(&Authority, &mut HandComponent), Without<GrabbableComponent>>,
+    mut grabbable_query: Query<(&mut Authority, &mut GrabbableComponent), Without<HandComponent>>,
     entities_by_net_id: Res<EntitiesByNetId>,
 ) {
     for (&player_id, actions) in &actions.0 {
@@ -111,8 +111,8 @@ enum ApplyActionError {
 fn apply_action(
     player_id: PlayerId,
     action: Action,
-    hand_query: &mut Query<(&Authority, &mut Hand), Without<Grabbable>>,
-    grabbable_query: &mut Query<(&mut Authority, &mut Grabbable), Without<Hand>>,
+    hand_query: &mut Query<(&Authority, &mut HandComponent), Without<GrabbableComponent>>,
+    grabbable_query: &mut Query<(&mut Authority, &mut GrabbableComponent), Without<HandComponent>>,
     entities_by_net_id: &EntitiesByNetId,
 ) -> Result<(), ApplyActionError> {
     match action {

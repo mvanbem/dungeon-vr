@@ -3,6 +3,7 @@ use std::num::{NonZeroU32, NonZeroU8};
 
 use bevy_ecs::prelude::*;
 use dungeon_vr_stream_codec::{ReadError, StreamCodec};
+use rapier3d::na::Isometry3;
 use thiserror::Error;
 
 use crate::PlayerId;
@@ -16,7 +17,14 @@ pub enum ReadNetIdError {
     InvalidNetId,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Component)]
+/// Component tracking a synchronized entity's [`NetId`].
+#[derive(Clone, Copy, Debug, Component)]
+pub struct Synchronized {
+    pub net_id: NetId,
+}
+
+/// A unique integer assigned by the server to each synchronized entity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NetId(pub NonZeroU32);
 
 impl StreamCodec for NetId {
@@ -34,6 +42,10 @@ impl StreamCodec for NetId {
         self.0.get().write_to(w)
     }
 }
+
+/// Component tracking authority for entities that can be owned by a player.
+#[derive(Clone, Copy, Debug, Component)]
+pub struct AuthorityComponent(Authority);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Component)]
 pub enum Authority {
@@ -61,8 +73,7 @@ impl StreamCodec for Authority {
     }
 }
 
-#[derive(Bundle)]
-pub struct Replicated {
-    pub net_id: NetId,
-    pub authority: Authority,
-}
+pub struct LocalAuthorityResource(pub Authority);
+
+#[derive(Component, Default)]
+pub struct TransformComponent(pub Isometry3<f32>);

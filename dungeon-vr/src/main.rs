@@ -21,7 +21,7 @@ use rapier3d::na::{self, matrix, vector, Matrix4};
 use slotmap::Key;
 use tokio::net::UdpSocket;
 
-use crate::asset::{MaterialAssetKey, MaterialAssets, ModelAssets};
+use crate::asset::{MaterialAssets, MaterialHandle, ModelAssets};
 use crate::audio::mixer::Mixer;
 use crate::game::{Game, VrHand, VrTracking};
 use crate::interop::xr_posef_to_na_isometry;
@@ -34,7 +34,6 @@ use crate::xr_session::{XrSession, XrSessionHand};
 
 mod asset;
 mod audio;
-mod components;
 mod game;
 mod interop;
 mod material;
@@ -115,7 +114,6 @@ pub async fn main() -> Result<()> {
     let mixer = Mixer::new()?;
     let mut material_assets = MaterialAssets::new(&vk, &render, &mut ());
     let mut model_assets = ModelAssets::new(&vk, &render, &mut material_assets);
-    let mut game = Game::new(&vk, &render, &mut material_assets, &mut model_assets);
 
     let mut swapchain = None;
     main_loop(
@@ -130,7 +128,6 @@ pub async fn main() -> Result<()> {
         &mut swapchain,
         &mut material_assets,
         &mut model_assets,
-        &mut game,
     );
 
     drop(xrs);
@@ -201,8 +198,9 @@ fn main_loop<'a>(
     swapchain: &mut Option<Swapchain<'a>>,
     material_assets: &mut MaterialAssets,
     model_assets: &mut ModelAssets,
-    game: &mut Game,
 ) {
+    let mut game = Game::new();
+
     let mut event_storage = xr::EventDataBuffer::new();
     let mut session_running = false;
     let mut frame = 0;
@@ -435,7 +433,7 @@ fn main_loop<'a>(
 
         // Group primitive instances.
         let mut transforms_by_primitive_by_material: HashMap<
-            MaterialAssetKey,
+            MaterialHandle,
             HashMap<RefEq<Primitive>, Vec<Matrix4<f32>>>,
         > = Default::default();
         for (model_key, transforms) in models {
