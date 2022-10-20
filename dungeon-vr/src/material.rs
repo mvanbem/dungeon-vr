@@ -26,6 +26,7 @@ impl Loader for Material {
     }
 
     fn load(vk: &VkHandles, render: &RenderData, _ctx: &mut (), id: &str) -> Result<Self> {
+        log::info!("Loading material {id}");
         let data = read(id)?;
         let (image, image_memory, image_view) =
             load_image(vk, &data).with_context(|| format!("opening image {id:?}"))?;

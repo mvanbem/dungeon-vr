@@ -5,10 +5,11 @@ use std::fmt::{self, Display, Formatter};
 use std::num::NonZeroU8;
 use std::time::Duration;
 
+use bevy_ecs::prelude::Component;
 use dungeon_vr_stream_codec::{ReadError, StreamCodec};
 use thiserror::Error;
 
-use crate::time::ServerTime;
+use crate::physics::PhysicsResource;
 
 pub mod action;
 pub mod collider_cache;
@@ -66,14 +67,26 @@ impl TickId {
     pub fn next(self) -> Self {
         Self(self.0.checked_add(1).unwrap())
     }
+}
 
-    pub fn latest_tick_for_time(time: ServerTime) -> Self {
-        const TICK_INTERVAL_MICROS: u64 = TICK_INTERVAL.as_micros() as u64;
-        Self((time.to_micros_since_epoch() / TICK_INTERVAL_MICROS) as u32)
+pub struct NetComponentDestroyContext<'a> {
+    pub physics: &'a mut PhysicsResource,
+}
+
+impl<'a> NetComponentDestroyContext<'a> {
+    pub fn borrow_mut(&mut self) -> NetComponentDestroyContext {
+        NetComponentDestroyContext {
+            physics: &mut *self.physics,
+        }
+    }
+}
+
+pub trait NetComponent: Component + Sized {
+    fn apply_snapshot(&mut self, snapshot: Self) {
+        *self = snapshot;
     }
 
-    pub fn goal_time(self) -> ServerTime {
-        const TICK_INTERVAL_MICROS: u64 = TICK_INTERVAL.as_micros() as u64;
-        ServerTime::from_micros_since_epoch(self.0 as u64 * TICK_INTERVAL_MICROS)
+    fn destroy(self, ctx: NetComponentDestroyContext) {
+        let _ = ctx;
     }
 }

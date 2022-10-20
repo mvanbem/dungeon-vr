@@ -4,9 +4,9 @@ use bevy_ecs::prelude::*;
 use dungeon_vr_stream_codec::{ReadError, StreamCodec};
 use thiserror::Error;
 
-use crate::core::{Authority, NetId, ReadNetIdError};
+use crate::core::{Authority, NetId, ReadNetIdError, SynchronizedComponent};
 use crate::interaction::{GrabbableComponent, HandComponent, HandGrabState};
-use crate::resources::{AllActions, EntitiesByNetId};
+use crate::resources::{AllActionsResource, EntitiesByNetIdResource};
 use crate::PlayerId;
 
 /// Things players can do.
@@ -64,10 +64,16 @@ impl StreamCodec for Action {
 }
 
 pub fn apply_actions(
-    actions: Res<AllActions>,
-    mut hand_query: Query<(&Authority, &mut HandComponent), Without<GrabbableComponent>>,
-    mut grabbable_query: Query<(&mut Authority, &mut GrabbableComponent), Without<HandComponent>>,
-    entities_by_net_id: Res<EntitiesByNetId>,
+    actions: Res<AllActionsResource>,
+    mut hand_query: Query<
+        (&SynchronizedComponent, &mut HandComponent),
+        Without<GrabbableComponent>,
+    >,
+    mut grabbable_query: Query<
+        (&mut SynchronizedComponent, &mut GrabbableComponent),
+        Without<HandComponent>,
+    >,
+    entities_by_net_id: Res<EntitiesByNetIdResource>,
 ) {
     for (&player_id, actions) in &actions.0 {
         for action in actions.iter().copied() {
@@ -111,16 +117,23 @@ enum ApplyActionError {
 fn apply_action(
     player_id: PlayerId,
     action: Action,
-    hand_query: &mut Query<(&Authority, &mut HandComponent), Without<GrabbableComponent>>,
-    grabbable_query: &mut Query<(&mut Authority, &mut GrabbableComponent), Without<HandComponent>>,
-    entities_by_net_id: &EntitiesByNetId,
+    hand_query: &mut Query<
+        (&SynchronizedComponent, &mut HandComponent),
+        Without<GrabbableComponent>,
+    >,
+    grabbable_query: &mut Query<
+        (&mut SynchronizedComponent, &mut GrabbableComponent),
+        Without<HandComponent>,
+    >,
+    entities_by_net_id: &EntitiesByNetIdResource,
 ) -> Result<(), ApplyActionError> {
+    log::debug!("Applying action: {action:?}");
     match action {
         Action::Grab { hand_index, target } => {
             let (_, mut hand) = hand_query
                 .iter_mut()
-                .filter(|(&hand_authority, hand)| {
-                    hand_authority == Authority::Client(player_id) && hand.index == hand_index
+                .filter(|(hand_sync, hand)| {
+                    hand_sync.authority == Authority::Player(player_id) && hand.index == hand_index
                 })
                 .next()
                 .ok_or_else(|| ApplyActionError::HandNotFound)?;
@@ -133,14 +146,13 @@ fn apply_action(
                 .get(&target)
                 .copied()
                 .ok_or_else(|| ApplyActionError::GrabTargetNotFound)?;
-            let (mut grabbable_authority, mut grabbable) =
-                grabbable_query
-                    .get_mut(target_entity)
-                    .map_err(|_| ApplyActionError::GrabTargetNotFound)?;
-            if let Authority::Client(grabbable_player_id) = *grabbable_authority {
+            let (mut grabbable_sync, mut grabbable) = grabbable_query
+                .get_mut(target_entity)
+                .map_err(|_| ApplyActionError::GrabTargetNotFound)?;
+            if let Authority::Player(grabbable_player_id) = grabbable_sync.authority {
                 if grabbable_player_id != player_id {
                     return Err(ApplyActionError::GrabBadTargetAuthority(
-                        *grabbable_authority,
+                        grabbable_sync.authority,
                     ));
                 }
             }
@@ -149,15 +161,15 @@ fn apply_action(
             }
 
             hand.grab_state = HandGrabState::Grabbing(target);
-            *grabbable_authority = Authority::Client(player_id);
+            grabbable_sync.authority = Authority::Player(player_id);
             grabbable.grabbed = true;
             Ok(())
         }
         Action::Drop { hand_index } => {
             let (_, mut hand) = hand_query
                 .iter_mut()
-                .filter(|(&hand_authority, hand)| {
-                    hand_authority == Authority::Client(player_id) && hand.index == hand_index
+                .filter(|(hand_sync, hand)| {
+                    hand_sync.authority == Authority::Player(player_id) && hand.index == hand_index
                 })
                 .next()
                 .ok_or_else(|| ApplyActionError::HandNotFound)?;
@@ -167,13 +179,13 @@ fn apply_action(
                 .ok_or_else(|| ApplyActionError::DropBadHandGrabState)?;
 
             let target_entity = entities_by_net_id.0.get(&target).copied().unwrap();
-            let (mut grabbable_authority, mut grabbable) =
+            let (mut grabbable_sync, mut grabbable) =
                 grabbable_query.get_mut(target_entity).unwrap();
-            assert_eq!(*grabbable_authority, Authority::Client(player_id));
+            assert_eq!(grabbable_sync.authority, Authority::Player(player_id));
             assert!(grabbable.grabbed);
 
             hand.grab_state = HandGrabState::Empty;
-            *grabbable_authority = Authority::Server;
+            grabbable_sync.authority = Authority::Server;
             grabbable.grabbed = false;
             Ok(())
         }

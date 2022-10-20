@@ -1,8 +1,7 @@
 use std::convert::Infallible;
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use rapier3d::na::{self as nalgebra, Isometry3, UnitQuaternion};
-use rapier3d::na::{vector, Quaternion, Vector3};
+use rapier3d::na::{self as nalgebra, vector, Isometry3, Quaternion, UnitQuaternion, Vector3};
 
 use crate::{eof, ReadError, StreamCodec, O};
 

@@ -96,6 +96,7 @@ impl ColliderCache {
         let collider = match key {
             BorrowedColliderCacheKey::ConvexHull(name) => {
                 let path = format!("assets/{name}.gltf");
+                log::info!("Loading collider {path}");
                 let (document, buffers, _) = gltf::import(&path).unwrap();
                 assert_eq!(document.meshes().len(), 1);
                 let mesh = document.meshes().next().unwrap();

@@ -109,11 +109,11 @@ impl<Addr: AddrBound> ConnectionServer<Addr> {
                 Some(requests) => requests.recv().left_future(),
                 None => pending().right_future(),
             };
-            let mut dynamic_events: FuturesUnordered<_> = self
-                .connections
-                .iter_mut()
-                .map(|(addr, connection)| connection.wait_for_event(*addr))
-                .collect();
+            let mut dynamic_events = FuturesUnordered::from_iter(
+                self.connections
+                    .iter_mut()
+                    .map(|(addr, connection)| connection.wait_for_event(*addr)),
+            );
 
             let event = select! {
                 biased;

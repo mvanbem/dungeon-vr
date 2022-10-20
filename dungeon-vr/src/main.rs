@@ -12,7 +12,7 @@ use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use clap::Parser;
 use dungeon_vr_connection_client::ConnectionClient;
-use dungeon_vr_session_client::{Event as SessionEvent, SessionClient};
+use dungeon_vr_session_client::{Event as SessionEvent, Request as SessionRequest, SessionClient};
 use dungeon_vr_socket::fakelag::FakeLagConnectedSocket;
 use dungeon_vr_socket::ConnectedSocket;
 use openxr as xr;
@@ -23,7 +23,7 @@ use tokio::net::UdpSocket;
 
 use crate::asset::{MaterialAssets, MaterialHandle, ModelAssets};
 use crate::audio::mixer::Mixer;
-use crate::game::{Game, VrHand, VrTracking};
+use crate::game::{Game, UpdateResult, VrHand, VrTracking};
 use crate::interop::xr_posef_to_na_isometry;
 use crate::model::Primitive;
 use crate::render_data::RenderData;
@@ -419,6 +419,9 @@ fn main_loop<'a>(
         if let Some(session) = session.as_deref_mut() {
             while let Some(event) = session.try_recv_event() {
                 match event {
+                    SessionEvent::Start { local_player_id } => {
+                        game.start_net_session(local_player_id)
+                    }
                     SessionEvent::Snapshot { tick_id, data } => game.handle_snapshot(tick_id, data),
                     SessionEvent::Voice(_) => (),
                     SessionEvent::TimeSync {
@@ -429,14 +432,30 @@ fn main_loop<'a>(
                 }
             }
         }
-        let models = game.update(vk, render, material_assets, model_assets);
+        let UpdateResult {
+            model_transforms,
+            actions_committed,
+            owned_transforms,
+        } = game.update(vk, render, material_assets, model_assets);
+
+        // Pass newly committed actions to the session.
+        if let Some(session) = session.as_deref_mut() {
+            session
+                .try_send_request(SessionRequest::CommitActions(actions_committed))
+                .unwrap();
+            if owned_transforms.len() > 0 {
+                session
+                    .try_send_request(SessionRequest::UpdateOwnedTransforms(owned_transforms))
+                    .unwrap();
+            }
+        }
 
         // Group primitive instances.
         let mut transforms_by_primitive_by_material: HashMap<
             MaterialHandle,
             HashMap<RefEq<Primitive>, Vec<Matrix4<f32>>>,
         > = Default::default();
-        for (model_key, transforms) in models {
+        for (model_key, transforms) in model_transforms {
             let model = model_assets.get(model_key);
             for primitive in &model.primitives {
                 transforms_by_primitive_by_material

@@ -1,6 +1,8 @@
 use bevy_ecs::prelude::*;
 use slotmap::{new_key_type, Key};
 
+use crate::NetComponent;
+
 new_key_type! { pub struct ModelHandle; }
 
 /// Component for rendering a model with an entity's transform.
@@ -20,5 +22,11 @@ impl RenderComponent {
             model_name: name.into(),
             model_handle: ModelHandle::null(),
         }
+    }
+}
+
+impl NetComponent for RenderComponent {
+    fn apply_snapshot(&mut self, snapshot: Self) {
+        self.model_name = snapshot.model_name;
     }
 }

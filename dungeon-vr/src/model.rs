@@ -54,6 +54,7 @@ impl Loader for Model {
         id: &str,
     ) -> Result<Self> {
         let path = format!("assets/{id}.gltf");
+        log::info!("Loading model {path}");
         let (document, buffers, _) = gltf::import(&path)?;
 
         assert_eq!(document.meshes().len(), 1);

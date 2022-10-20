@@ -7,7 +7,7 @@ use crate::core::NetId;
 use crate::PlayerId;
 
 #[derive(Default)]
-pub struct AllActions(pub HashMap<PlayerId, Vec<Action>>);
+pub struct AllActionsResource(pub HashMap<PlayerId, Vec<Action>>);
 
 #[derive(Default)]
-pub struct EntitiesByNetId(pub BTreeMap<NetId, Entity>);
+pub struct EntitiesByNetIdResource(pub BTreeMap<NetId, Entity>);

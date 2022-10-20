@@ -4,19 +4,22 @@ use dungeon_vr_stream_codec::{ReadError, StreamCodec};
 use thiserror::Error;
 
 use crate::action::ReadActionError;
-use crate::packet::actions_packet::ActionsPacket;
+use crate::core::ReadNetIdError;
+use crate::packet::commit_actions_packet::CommitActionsPacket;
 use crate::packet::game_state_packet::GameStatePacket;
 use crate::packet::ping_packet::PingPacket;
 use crate::packet::player_assignment_packet::PlayerAssignmentPacket;
 use crate::packet::pong_packet::PongPacket;
+use crate::packet::update_owned_transforms_packet::UpdateOwnedTransformsPacket;
 use crate::packet::voice_packet::VoicePacket;
 use crate::ReadPlayerIdError;
 
-pub mod actions_packet;
+pub mod commit_actions_packet;
 pub mod game_state_packet;
 pub mod ping_packet;
 pub mod player_assignment_packet;
 pub mod pong_packet;
+pub mod update_owned_transforms_packet;
 pub mod voice_packet;
 
 #[derive(Debug, Error)]
@@ -29,6 +32,9 @@ pub enum ReadPacketError {
 
     #[error("{0}")]
     ReadActionError(#[from] ReadActionError),
+
+    #[error("{0}")]
+    ReadNetIdError(#[from] ReadNetIdError),
 
     #[error("invalid packet type encoding: 0x{0:02x}")]
     InvalidPacketType(u8),
@@ -50,8 +56,9 @@ pub enum PacketKind {
     Pong,
     GameState,
     Voice,
-    Actions,
     PlayerAssignment,
+    CommitActions,
+    UpdateOwnedTransforms,
 }
 
 impl StreamCodec for PacketKind {
@@ -76,8 +83,9 @@ impl TryFrom<u8> for PacketKind {
             x if x == Self::Pong as u8 => Ok(Self::Pong),
             x if x == Self::GameState as u8 => Ok(Self::GameState),
             x if x == Self::Voice as u8 => Ok(Self::Voice),
-            x if x == Self::Actions as u8 => Ok(Self::Actions),
             x if x == Self::PlayerAssignment as u8 => Ok(Self::PlayerAssignment),
+            x if x == Self::CommitActions as u8 => Ok(Self::CommitActions),
+            x if x == Self::UpdateOwnedTransforms as u8 => Ok(Self::UpdateOwnedTransforms),
             x => Err(ReadPacketError::InvalidPacketType(x)),
         }
     }
@@ -88,8 +96,9 @@ pub enum Packet {
     Pong(PongPacket),
     GameState(GameStatePacket),
     Voice(VoicePacket),
-    Actions(ActionsPacket),
     PlayerAssignment(PlayerAssignmentPacket),
+    CommitActions(CommitActionsPacket),
+    UpdateOwnedTransforms(UpdateOwnedTransformsPacket),
 }
 
 impl Packet {
@@ -99,8 +108,9 @@ impl Packet {
             Self::Pong(_) => PacketKind::Pong,
             Self::GameState(_) => PacketKind::GameState,
             Self::Voice(_) => PacketKind::Voice,
-            Self::Actions(_) => PacketKind::Actions,
             Self::PlayerAssignment(_) => PacketKind::PlayerAssignment,
+            Self::CommitActions(_) => PacketKind::CommitActions,
+            Self::UpdateOwnedTransforms(_) => PacketKind::UpdateOwnedTransforms,
         }
     }
 }
@@ -115,9 +125,14 @@ impl StreamCodec for Packet {
             PacketKind::Pong => Ok(Self::Pong(PongPacket::read_from(r)?)),
             PacketKind::GameState => Ok(Self::GameState(GameStatePacket::read_from(r)?)),
             PacketKind::Voice => Ok(Self::Voice(VoicePacket::read_from(r)?)),
-            PacketKind::Actions => Ok(Self::Actions(ActionsPacket::read_from(r)?)),
             PacketKind::PlayerAssignment => Ok(Self::PlayerAssignment(
                 PlayerAssignmentPacket::read_from(r)?,
+            )),
+            PacketKind::CommitActions => {
+                Ok(Self::CommitActions(CommitActionsPacket::read_from(r)?))
+            }
+            PacketKind::UpdateOwnedTransforms => Ok(Self::UpdateOwnedTransforms(
+                UpdateOwnedTransformsPacket::read_from(r)?,
             )),
         }
     }
@@ -129,8 +144,9 @@ impl StreamCodec for Packet {
             Self::Pong(packet) => packet.write_to(w),
             Self::GameState(packet) => packet.write_to(w),
             Self::Voice(packet) => packet.write_to(w),
-            Self::Actions(packet) => packet.write_to(w),
             Self::PlayerAssignment(packet) => packet.write_to(w),
+            Self::CommitActions(packet) => packet.write_to(w),
+            Self::UpdateOwnedTransforms(packet) => packet.write_to(w),
         }
     }
 }

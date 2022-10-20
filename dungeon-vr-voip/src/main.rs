@@ -33,8 +33,7 @@ pub async fn main() -> Result<()> {
     socket.connect(server_addr).await?;
     let (_connection_cancel_guard, connection_requests, connection_events) =
         ConnectionClient::spawn(Box::new(socket));
-    let (_session_cancel_guard, mut session_events, session_requests) =
-        SessionClient::new(connection_requests, connection_events).split();
+    let mut session_client = SessionClient::new(connection_requests, connection_events);
 
     let mut audio_ctx = AudioContext::new()?;
     let mut voice_from_microphone = audio_ctx.take_voice_from_microphone().unwrap();
@@ -49,16 +48,14 @@ pub async fn main() -> Result<()> {
             _ = cancel_token.cancelled() => break,
 
             data = voice_from_microphone.recv() => if let Some(data) = data {
-                let _ = session_requests.try_send(SessionRequest::SendVoice(data));
+                let _ = session_client.try_send_request(SessionRequest::SendVoice(data));
             },
 
-            event = session_events.recv() => if let Some(event) = event {
-                match event {
-                    SessionEvent::Voice(data) => {
-                        let _ = voice_to_speakers.try_send(data);
-                    }
-                    _ => (),
+            event = session_client.recv_event() => match event {
+                SessionEvent::Voice(data) => {
+                    let _ = voice_to_speakers.try_send(data);
                 }
+                _ => (),
             },
         }
     }

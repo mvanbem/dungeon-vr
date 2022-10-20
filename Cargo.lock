@@ -897,6 +897,7 @@ dependencies = [
  "dungeon-vr-stream-codec",
  "futures",
  "log",
+ "rapier3d",
  "tokio",
 ]
 

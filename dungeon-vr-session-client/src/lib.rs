@@ -1,20 +1,27 @@
+use std::collections::{BTreeMap, HashMap};
 use std::future::pending;
 use std::time::Duration;
 
 use dungeon_vr_connection_client::{
     ConnectionState, Event as ConnectionEvent, Request as ConnectionRequest,
 };
+use dungeon_vr_session_shared::action::Action;
+use dungeon_vr_session_shared::core::NetId;
+use dungeon_vr_session_shared::packet::commit_actions_packet::CommitActionsPacket;
 use dungeon_vr_session_shared::packet::game_state_packet::GameStatePacket;
 use dungeon_vr_session_shared::packet::ping_packet::PingPacket;
+use dungeon_vr_session_shared::packet::player_assignment_packet::PlayerAssignmentPacket;
 use dungeon_vr_session_shared::packet::pong_packet::PongPacket;
+use dungeon_vr_session_shared::packet::update_owned_transforms_packet::UpdateOwnedTransformsPacket;
 use dungeon_vr_session_shared::packet::voice_packet::VoicePacket;
 use dungeon_vr_session_shared::packet::Packet;
 use dungeon_vr_session_shared::time::{
     ClientEpoch, ClientOffset, ClientTimeToServerTime, LocalEpoch,
 };
-use dungeon_vr_session_shared::TickId;
+use dungeon_vr_session_shared::{PlayerId, TickId};
 use dungeon_vr_stream_codec::StreamCodec;
 use futures::FutureExt;
+use rapier3d::prelude::*;
 use tokio::select;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Interval};
@@ -23,7 +30,7 @@ const EVENT_BUFFER_SIZE: usize = 256;
 const REQUEST_BUFFER_SIZE: usize = 256;
 
 pub struct SessionClient {
-    cancel_guard: cancel::Guard,
+    _cancel_guard: cancel::Guard,
     events: mpsc::Receiver<Event>,
     requests: mpsc::Sender<Request>,
 }
@@ -53,7 +60,7 @@ impl SessionClient {
             .run(),
         );
         Self {
-            cancel_guard: cancel_token.guard(),
+            _cancel_guard: cancel_token.guard(),
             events: event_rx,
             requests: request_tx,
         }
@@ -67,8 +74,8 @@ impl SessionClient {
         self.events.recv().await.unwrap()
     }
 
-    pub fn split(self) -> (cancel::Guard, mpsc::Receiver<Event>, mpsc::Sender<Request>) {
-        (self.cancel_guard, self.events, self.requests)
+    pub fn try_send_request(&self, request: Request) -> Result<(), ()> {
+        self.requests.try_send(request).map_err(|_| ())
     }
 }
 
@@ -79,12 +86,16 @@ struct InnerClient {
     events: mpsc::Sender<Event>,
     requests: mpsc::Receiver<Request>,
     epoch: ClientEpoch,
+    started: bool,
     time_sync: Option<Interval>,
     round_trip_time: Option<f64>,
     client_time_to_server_time: Option<f64>,
 }
 
 pub enum Event {
+    Start {
+        local_player_id: PlayerId,
+    },
     Snapshot {
         tick_id: TickId,
         data: Vec<u8>,
@@ -99,6 +110,8 @@ pub enum Event {
 
 pub enum Request {
     SendVoice(Vec<u8>),
+    CommitActions(BTreeMap<TickId, Vec<Action>>),
+    UpdateOwnedTransforms(HashMap<NetId, Isometry<f32>>),
 }
 
 impl InnerClient {
@@ -116,6 +129,7 @@ impl InnerClient {
             events,
             requests,
             epoch: LocalEpoch::new(),
+            started: false,
             time_sync: None,
             round_trip_time: None,
             client_time_to_server_time: None,
@@ -203,6 +217,7 @@ impl InnerClient {
             Packet::Pong(packet) => self.handle_pong_packet(packet).await,
             Packet::GameState(packet) => self.handle_game_state_packet(packet).await,
             Packet::Voice(packet) => self.handle_voice_packet(packet).await,
+            Packet::PlayerAssignment(packet) => self.handle_player_assignment_packet(packet).await,
             _ => {
                 log::error!("Unexpected game data packet: {:?}", packet.kind());
             }
@@ -241,33 +256,55 @@ impl InnerClient {
             }
         });
 
-        let _ = self
-            .events
-            .send(Event::TimeSync {
-                client_epoch: self.epoch,
-                round_trip_time: ClientOffset::from_micros(
-                    self.round_trip_time.unwrap().round() as i64
-                ),
-                offset: ClientTimeToServerTime::from_micros(
-                    self.client_time_to_server_time.unwrap().round() as i64,
-                )
-                .into(),
-            })
+        if self.started {
+            send_event(
+                &self.events,
+                Event::TimeSync {
+                    client_epoch: self.epoch,
+                    round_trip_time: ClientOffset::from_micros(
+                        self.round_trip_time.unwrap().round() as i64,
+                    ),
+                    offset: ClientTimeToServerTime::from_micros(
+                        self.client_time_to_server_time.unwrap().round() as i64,
+                    )
+                    .into(),
+                },
+            )
             .await;
+        }
     }
 
     async fn handle_game_state_packet(&mut self, packet: GameStatePacket) {
-        let _ = self
-            .events
-            .send(Event::Snapshot {
-                tick_id: packet.tick_id,
-                data: packet.serialized_game_state,
-            })
+        if self.started {
+            send_event(
+                &self.events,
+                Event::Snapshot {
+                    tick_id: packet.tick_id,
+                    data: packet.serialized_game_state,
+                },
+            )
             .await;
+        }
     }
 
     async fn handle_voice_packet(&mut self, packet: VoicePacket) {
-        let _ = self.events.send(Event::Voice(packet.data)).await;
+        send_event(&self.events, Event::Voice(packet.data)).await;
+    }
+
+    async fn handle_player_assignment_packet(&mut self, packet: PlayerAssignmentPacket) {
+        if self.started {
+            return;
+        }
+
+        log::info!("Player assignment received: {}", packet.player_id);
+        self.started = true;
+        send_event(
+            &self.events,
+            Event::Start {
+                local_player_id: packet.player_id,
+            },
+        )
+        .await;
     }
 
     fn handle_connection_dropped(&mut self) {
@@ -280,6 +317,26 @@ impl InnerClient {
                 send_packet(
                     &self.connection_requests,
                     Packet::Voice(VoicePacket { data }),
+                )
+                .await;
+            }
+            Request::CommitActions(actions_by_tick_id) => {
+                // TODO: Record committed actions and send them redundantly until acknowledged by
+                // the server. This is the simplest thing that can work, but it drops inputs on a
+                // single lost packet.
+                send_packet(
+                    &self.connection_requests,
+                    Packet::CommitActions(CommitActionsPacket { actions_by_tick_id }),
+                )
+                .await;
+            }
+            Request::UpdateOwnedTransforms(transforms_by_net_id) => {
+                send_packet(
+                    &self.connection_requests,
+                    Packet::UpdateOwnedTransforms(UpdateOwnedTransformsPacket {
+                        after_tick_id: TickId(0), // TODO
+                        transforms_by_net_id,
+                    }),
                 )
                 .await;
             }
@@ -296,6 +353,10 @@ impl InnerClient {
         )
         .await;
     }
+}
+
+async fn send_event(events: &mpsc::Sender<Event>, event: Event) {
+    let _ = events.send(event).await;
 }
 
 async fn send_packet(requests: &mpsc::Sender<ConnectionRequest>, packet: Packet) {

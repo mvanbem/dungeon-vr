@@ -7,11 +7,11 @@ use crate::action::Action;
 use crate::packet::ReadPacketError;
 use crate::TickId;
 
-pub struct ActionsPacket {
+pub struct CommitActionsPacket {
     pub actions_by_tick_id: BTreeMap<TickId, Vec<Action>>,
 }
 
-impl StreamCodec for ActionsPacket {
+impl StreamCodec for CommitActionsPacket {
     type ReadError = ReadPacketError;
     type WriteError = Infallible;
 

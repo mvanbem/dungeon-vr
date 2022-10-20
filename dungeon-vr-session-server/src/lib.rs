@@ -1,37 +1,50 @@
-use std::collections::{hash_map, HashMap};
+use std::collections::{btree_map, hash_map, BTreeMap, HashMap};
 use std::f32::consts::FRAC_PI_2;
+use std::future::pending;
 use std::iter::repeat_with;
 use std::num::NonZeroU32;
 use std::pin::Pin;
+use std::time::Duration;
 
 use bevy_ecs::prelude::*;
 use dungeon_vr_connection_server::{
     ConnectionState, Event as ConnectionEvent, Request as ConnectionRequest,
 };
-use dungeon_vr_session_shared::action::apply_actions;
+use dungeon_vr_session_shared::action::{apply_actions, Action};
 use dungeon_vr_session_shared::collider_cache::ColliderCache;
-use dungeon_vr_session_shared::core::{Authority, NetId, Synchronized, TransformComponent};
+use dungeon_vr_session_shared::core::{
+    Authority, LocalAuthorityResource, NetId, SynchronizedComponent, TransformComponent,
+};
 use dungeon_vr_session_shared::fly_around::fly_around;
 use dungeon_vr_session_shared::fly_around::FlyAroundComponent;
-use dungeon_vr_session_shared::interaction::GrabbableComponent;
+use dungeon_vr_session_shared::interaction::{GrabbableComponent, HandComponent, HandGrabState};
+use dungeon_vr_session_shared::packet::commit_actions_packet::CommitActionsPacket;
 use dungeon_vr_session_shared::packet::game_state_packet::GameStatePacket;
 use dungeon_vr_session_shared::packet::ping_packet::PingPacket;
+use dungeon_vr_session_shared::packet::player_assignment_packet::PlayerAssignmentPacket;
 use dungeon_vr_session_shared::packet::pong_packet::PongPacket;
+use dungeon_vr_session_shared::packet::update_owned_transforms_packet::UpdateOwnedTransformsPacket;
 use dungeon_vr_session_shared::packet::voice_packet::VoicePacket;
 use dungeon_vr_session_shared::packet::Packet;
-use dungeon_vr_session_shared::physics::{PhysicsComponent, PhysicsResource};
+use dungeon_vr_session_shared::physics::{
+    reset_forces, step_physics, sync_physics, update_rigid_body_transforms, PhysicsComponent,
+    PhysicsResource,
+};
 use dungeon_vr_session_shared::render::RenderComponent;
-use dungeon_vr_session_shared::resources::{AllActions, EntitiesByNetId};
+use dungeon_vr_session_shared::resources::{AllActionsResource, EntitiesByNetIdResource};
 use dungeon_vr_session_shared::snapshot::write_snapshot;
 use dungeon_vr_session_shared::time::{LocalEpoch, ServerEpoch};
 use dungeon_vr_session_shared::{PlayerId, TickId, TICK_INTERVAL};
 use dungeon_vr_socket::AddrBound;
 use dungeon_vr_stream_codec::StreamCodec;
-use rapier3d::na::{self as nalgebra, vector, Isometry3, UnitQuaternion};
-use rapier3d::prelude::{ColliderSet, RigidBodySet};
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
+use rapier3d::prelude::*;
 use tokio::select;
 use tokio::sync::mpsc;
-use tokio::time::{sleep_until, Sleep};
+use tokio::time::{interval, Interval};
+
+const SEND_ASSIGNMENT_INTERVAL: Duration = Duration::from_millis(250);
 
 trait PlayerIdExt {
     fn index(self) -> usize;
@@ -73,6 +86,7 @@ pub struct SessionServer {
 
 enum Event<Addr> {
     Connection(Option<ConnectionEvent<Addr>>),
+    PlayerEvent(PlayerEvent),
     Tick,
 }
 
@@ -108,8 +122,9 @@ struct InnerServer<Addr> {
     world: World,
     tick_schedule: Schedule,
     net_ids: NetIdAllocator,
-    tick_sleep: Pin<Box<Sleep>>,
-    current_tick: TickId,
+    tick_interval: Interval,
+    /// The ID of the most recently completed tick.
+    last_completed_tick_id: TickId,
 }
 
 struct ClientState {
@@ -118,6 +133,8 @@ struct ClientState {
 
 struct PlayerState<Addr> {
     addr: Addr,
+    send_assignment: Option<Pin<Box<Interval>>>,
+    actions_by_tick_id: BTreeMap<TickId, Vec<Action>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, StageLabel)]
@@ -127,8 +144,11 @@ enum StageLabel {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, SystemLabel)]
 enum SystemLabel {
+    Init,
     CoreTick,
     UpdateBeforePhysics,
+    PhysicsStep,
+    UpdateAfterPhysics,
 }
 
 impl<Addr: AddrBound> InnerServer<Addr> {
@@ -140,39 +160,40 @@ impl<Addr: AddrBound> InnerServer<Addr> {
     ) -> Self {
         let mut world = World::new();
         let mut net_ids = NetIdAllocator::new();
-        let mut entities_by_net_id = EntitiesByNetId::default();
+        let mut entities_by_net_id = EntitiesByNetIdResource::default();
 
         // Spawn world geometry.
         let mut spawn_context = SpawnContext {
             world: &mut world,
             net_ids: &mut net_ids,
+            entities_by_net_id: &mut entities_by_net_id,
         };
         spawn_context.spawn_static_model(
             "LowPolyDungeon/Dungeon_Custom_Center",
             vector![0.0, 0.0, 0.0].into(),
         );
         for side in 0..4 {
-            let rot = UnitQuaternion::from_scaled_axis(vector![0.0, FRAC_PI_2, 0.0] * side as f32);
+            let rot = Rotation::from_scaled_axis(vector![0.0, FRAC_PI_2, 0.0] * side as f32);
             spawn_context.spawn_static_model(
                 "LowPolyDungeon/Dungeon_Custom_Border_Flat",
-                Isometry3::from_parts((rot * vector![0.0, 0.0, -4.0]).into(), rot),
+                Isometry::from_parts((rot * vector![0.0, 0.0, -4.0]).into(), rot),
             );
             spawn_context.spawn_static_model(
                 "LowPolyDungeon/Dungeon_Wall_Var1",
-                Isometry3::from_parts((rot * vector![0.0, 0.0, -4.0]).into(), rot),
+                Isometry::from_parts((rot * vector![0.0, 0.0, -4.0]).into(), rot),
             );
 
             spawn_context.spawn_static_model(
                 "LowPolyDungeon/Dungeon_Custom_Corner_Flat",
-                Isometry3::from_parts((rot * vector![4.0, 0.0, 4.0]).into(), rot),
+                Isometry::from_parts((rot * vector![4.0, 0.0, 4.0]).into(), rot),
             );
             spawn_context.spawn_static_model(
                 "LowPolyDungeon/Dungeon_Wall_Var1",
-                Isometry3::from_parts((rot * vector![-4.0, 0.0, -4.0]).into(), rot),
+                Isometry::from_parts((rot * vector![-4.0, 0.0, -4.0]).into(), rot),
             );
             spawn_context.spawn_static_model(
                 "LowPolyDungeon/Dungeon_Wall_Var1",
-                Isometry3::from_parts((rot * vector![4.0, 0.0, -4.0]).into(), rot),
+                Isometry::from_parts((rot * vector![4.0, 0.0, -4.0]).into(), rot),
             );
         }
 
@@ -182,8 +203,10 @@ impl<Addr: AddrBound> InnerServer<Addr> {
             net_id,
             world
                 .spawn()
-                .insert(Synchronized { net_id })
-                .insert(Authority::Server)
+                .insert(SynchronizedComponent {
+                    net_id,
+                    authority: Authority::Server,
+                })
                 .insert(TransformComponent::default())
                 .insert(RenderComponent::new("LowPolyDungeon/Sword"))
                 .insert(FlyAroundComponent)
@@ -192,16 +215,22 @@ impl<Addr: AddrBound> InnerServer<Addr> {
 
         // Spawn a grabbable key.
         let net_id = net_ids.next();
-        world
-            .spawn()
-            .insert(Synchronized { net_id })
-            .insert(Authority::Server)
-            .insert(TransformComponent(vector![0.0, 1.0, 0.0].into()))
-            .insert(RenderComponent::new("LowPolyDungeon/Key_Silver"))
-            .insert(GrabbableComponent { grabbed: false })
-            .insert(PhysicsComponent::new_dynamic_ccd(
-                "LowPolyDungeon/Key_Silver",
-            ));
+        entities_by_net_id.0.insert(
+            net_id,
+            world
+                .spawn()
+                .insert(SynchronizedComponent {
+                    net_id,
+                    authority: Authority::Server,
+                })
+                .insert(TransformComponent(vector![0.0, 1.0, 0.0].into()))
+                .insert(RenderComponent::new("LowPolyDungeon/Key_Silver"))
+                .insert(GrabbableComponent { grabbed: false })
+                .insert(PhysicsComponent::new_dynamic_ccd(
+                    "LowPolyDungeon/Key_Silver",
+                ))
+                .id(),
+        );
 
         world.insert_resource(PhysicsResource::new(
             RigidBodySet::new(),
@@ -210,6 +239,7 @@ impl<Addr: AddrBound> InnerServer<Addr> {
             TICK_INTERVAL.as_secs_f32(),
         ));
         world.insert_resource(entities_by_net_id);
+        world.insert_resource(LocalAuthorityResource(Some(Authority::Server)));
 
         let epoch = LocalEpoch::new();
         Self {
@@ -225,6 +255,13 @@ impl<Addr: AddrBound> InnerServer<Addr> {
                 SystemStage::parallel()
                     .with_system_set(
                         SystemSet::new()
+                            .label(SystemLabel::Init)
+                            .with_system(reset_forces)
+                            .with_system(sync_physics),
+                    )
+                    .with_system_set(
+                        SystemSet::new()
+                            .after(SystemLabel::Init)
                             .label(SystemLabel::CoreTick)
                             .with_system(apply_actions),
                     )
@@ -233,27 +270,53 @@ impl<Addr: AddrBound> InnerServer<Addr> {
                             .after(SystemLabel::CoreTick)
                             .label(SystemLabel::UpdateBeforePhysics)
                             .with_system(fly_around),
+                    )
+                    .with_system_set(
+                        SystemSet::new()
+                            .after(SystemLabel::UpdateBeforePhysics)
+                            .label(SystemLabel::PhysicsStep)
+                            .with_system(step_physics),
+                    )
+                    .with_system_set(
+                        SystemSet::new()
+                            .after(SystemLabel::PhysicsStep)
+                            .label(SystemLabel::UpdateAfterPhysics)
+                            .with_system(update_rigid_body_transforms),
                     ),
             ),
             net_ids,
-            // NOTE: This is early, but it only affects the very first tick.
-            tick_sleep: Box::pin(sleep_until(epoch.instant())),
-            current_tick: TickId(0),
+            tick_interval: interval(TICK_INTERVAL),
+            last_completed_tick_id: TickId(0),
         }
     }
 
     async fn run(mut self) {
         while !self.cancel_token.is_cancelled() {
+            let mut dynamic_events =
+                FuturesUnordered::from_iter(self.players.iter_mut().enumerate().filter_map(
+                    |(index, player)| {
+                        player.as_mut().map(move |player| async move {
+                            Event::PlayerEvent(
+                                player.wait_for_event(PlayerId::from_index(index)).await,
+                            )
+                        })
+                    },
+                ));
+
             let event = select! {
                 biased;
 
                 event = self.connection_events.recv() => Event::Connection(event),
 
-                _ = self.tick_sleep.as_mut() => Event::Tick,
+                Some(event) = dynamic_events.next() => event,
+
+                _ = self.tick_interval.tick() => Event::Tick,
             };
+            drop(dynamic_events);
 
             match event {
                 Event::Connection(event) => self.handle_connection_event(event.unwrap()).await,
+                Event::PlayerEvent(event) => self.handle_player_event(event).await,
                 Event::Tick => self.handle_tick().await,
             }
         }
@@ -269,6 +332,20 @@ impl<Addr: AddrBound> InnerServer<Addr> {
         }
     }
 
+    async fn handle_player_event(&mut self, event: PlayerEvent) {
+        match event {
+            PlayerEvent::SendAssignment { player_id } => {
+                let player = self.players[player_id.index()].as_mut().unwrap();
+                send_game_data(
+                    &self.connection_requests,
+                    player.addr,
+                    Packet::PlayerAssignment(PlayerAssignmentPacket { player_id }),
+                )
+                .await;
+            }
+        }
+    }
+
     fn handle_connection_state(&mut self, addr: Addr, state: ConnectionState) {
         match state {
             ConnectionState::Disconnected => {
@@ -278,11 +355,15 @@ impl<Addr: AddrBound> InnerServer<Addr> {
                 };
                 // Connections may or may not pass through the Disconnecting state on their way to
                 // Disconnected, so there might still be a player mapping.
-                if let Some(player_id) = client_entry.get().player_id {
+                let player_id = client_entry.get().player_id;
+                if let Some(player_id) = player_id {
                     log::info!("{player_id} disconnected");
                     self.players[player_id.index()] = None;
                 }
                 client_entry.remove();
+                if let Some(player_id) = player_id {
+                    self.despawn_player(player_id);
+                }
             }
             ConnectionState::Pending => {
                 let prev = self.clients.insert(addr, ClientState { player_id: None });
@@ -294,8 +375,18 @@ impl<Addr: AddrBound> InnerServer<Addr> {
                     Some(index) => {
                         let player_id = PlayerId::from_index(index);
                         log::info!("Peer {addr} connected as {player_id}");
-                        self.players[index] = Some(PlayerState { addr });
-                        client.player_id = Some(player_id);
+                        self.players[index] = Some(PlayerState {
+                            addr,
+                            // Prepare to tell this player their player ID assignment repeatedly
+                            // until we process a session packet indicating they got the message.
+                            send_assignment: Some(Box::pin(interval(SEND_ASSIGNMENT_INTERVAL))),
+                            actions_by_tick_id: BTreeMap::new(),
+                        });
+                        *client = ClientState {
+                            player_id: Some(player_id),
+                        };
+
+                        self.spawn_player(player_id);
                     }
                     None => {
                         log::info!("Peer {addr} connected, but the server is full");
@@ -308,9 +399,73 @@ impl<Addr: AddrBound> InnerServer<Addr> {
                 if let Some(player_id) = self.clients[&addr].player_id {
                     log::info!("{player_id} disconnected");
                     self.players[player_id.index()] = None;
+                    self.despawn_player(player_id);
                 }
             }
         }
+    }
+
+    fn spawn_player(&mut self, player_id: PlayerId) {
+        log::info!("Spawning hands for {player_id}");
+        for index in 0..2 {
+            let net_id = self.net_ids.next();
+            let entity = self
+                .world
+                .spawn()
+                .insert(SynchronizedComponent {
+                    net_id,
+                    authority: Authority::Player(player_id),
+                })
+                .insert(TransformComponent::default())
+                .insert(RenderComponent::new(["left_hand", "right_hand"][index]))
+                .insert(HandComponent {
+                    index,
+                    grab_state: HandGrabState::Empty,
+                })
+                .id();
+            self.world
+                .resource_mut::<EntitiesByNetIdResource>()
+                .0
+                .insert(net_id, entity);
+        }
+    }
+
+    fn despawn_player(&mut self, player_id: PlayerId) {
+        // Despawn any hands owned by the player.
+        let owned_hands = Vec::from_iter(
+            self.world
+                .query_filtered::<(Entity, &SynchronizedComponent), With<HandComponent>>()
+                .iter(&self.world)
+                .filter_map(|(entity, synchronized)| {
+                    if synchronized.authority == Authority::Player(player_id) {
+                        Some((entity, synchronized.net_id))
+                    } else {
+                        None
+                    }
+                }),
+        );
+        log::info!("Despawning {} hands for {player_id}", owned_hands.len());
+        for (entity, net_id) in owned_hands {
+            self.world.despawn(entity);
+            self.world
+                .resource_mut::<EntitiesByNetIdResource>()
+                .0
+                .remove(&net_id);
+        }
+
+        // Transfer any other entities owned by the player back to server authority.
+        let mut count = 0usize;
+        for mut synchronized in self
+            .world
+            .query::<&mut SynchronizedComponent>()
+            .iter_mut(&mut self.world)
+        {
+            if synchronized.authority == Authority::Player(player_id) {
+                synchronized.authority = Authority::Server;
+                count += 1;
+            }
+        }
+        log::info!("Reclaimed {count} entities from {player_id}");
     }
 
     async fn handle_connection_game_data(&mut self, addr: Addr, data: Vec<u8>) {
@@ -333,6 +488,11 @@ impl<Addr: AddrBound> InnerServer<Addr> {
         match packet {
             Packet::Ping(packet) => self.handle_ping_packet(addr, packet).await,
             Packet::Voice(packet) => self.handle_voice_packet(addr, packet).await,
+            Packet::CommitActions(packet) => self.handle_commit_actions_packet(addr, packet).await,
+            Packet::UpdateOwnedTransforms(packet) => {
+                self.handle_update_owned_transforms_packet(addr, packet)
+                    .await
+            }
             _ => {
                 log::error!("Unexpected game data packet: {:?}", packet.kind());
             }
@@ -369,18 +529,84 @@ impl<Addr: AddrBound> InnerServer<Addr> {
         }
     }
 
+    async fn handle_commit_actions_packet(&mut self, addr: Addr, packet: CommitActionsPacket) {
+        let player_id = match self.clients[&addr].player_id {
+            Some(player_id) => player_id,
+            None => {
+                log::warn!("Client {addr}: Dropping commit actions packet: player ID not assigned");
+                return;
+            }
+        };
+        let player = self.players[player_id.index()].as_mut().unwrap();
+        for (tick_id, actions) in packet.actions_by_tick_id {
+            match player.actions_by_tick_id.entry(tick_id) {
+                btree_map::Entry::Occupied(_) => {
+                    // Actions have already been committed for this tick.
+                }
+                btree_map::Entry::Vacant(entry) => {
+                    entry.insert(actions);
+                }
+            }
+        }
+    }
+
+    async fn handle_update_owned_transforms_packet(
+        &mut self,
+        addr: Addr,
+        packet: UpdateOwnedTransformsPacket,
+    ) {
+        let player_id = match self.clients[&addr].player_id {
+            Some(player_id) => player_id,
+            None => {
+                log::warn!("Client {addr}: Dropping commit actions packet: player ID not assigned");
+                return;
+            }
+        };
+        // TODO: Use the tick ID in the packet to prevent late packets from introducing excessive
+        // jitter. Also everyone should be interpolating.
+        for (net_id, transform) in packet.transforms_by_net_id {
+            if let Some(&entity) = self
+                .world
+                .resource::<EntitiesByNetIdResource>()
+                .0
+                .get(&net_id)
+            {
+                if let Some(synchronized) = self.world.get::<SynchronizedComponent>(entity) {
+                    if synchronized.authority == Authority::Player(player_id) {
+                        self.world.get_mut::<TransformComponent>(entity).unwrap().0 = transform;
+                    }
+                }
+            }
+        }
+    }
+
     fn handle_connection_dropped(&mut self) {
         todo!()
     }
 
     async fn handle_tick(&mut self) {
-        self.current_tick = self.current_tick.next();
+        let tick_id = self.last_completed_tick_id.next();
 
-        // Gather the current buffered inputs for this tick from each connection.
-        // let player_inputs = self.players.iter().map(|x| x.buffered_input).collect();
-        self.world.insert_resource(self.current_tick);
-        self.world.insert_resource(AllActions::default());
+        // Gather the current committed actions for this tick from each player.
+        self.world.insert_resource(AllActionsResource({
+            let mut all_actions = HashMap::new();
+            for (index, player) in self.players.iter().enumerate() {
+                if let Some(player) = player {
+                    if let Some(actions) = player.actions_by_tick_id.get(&tick_id) {
+                        all_actions.insert(PlayerId::from_index(index), actions.clone());
+                    }
+                }
+            }
+            all_actions
+        }));
         self.tick_schedule.run(&mut self.world);
+
+        // Discard obsolete committed actions.
+        for player in self.players.iter_mut().flatten() {
+            player
+                .actions_by_tick_id
+                .retain(|&action_tick_id, _| action_tick_id > tick_id);
+        }
 
         // Send updates to all players.
         let snapshot = {
@@ -393,16 +619,14 @@ impl<Addr: AddrBound> InnerServer<Addr> {
                 &self.connection_requests,
                 player.addr,
                 Packet::GameState(GameStatePacket {
-                    tick_id: self.current_tick,
+                    tick_id,
                     serialized_game_state: snapshot.clone(),
                 }),
             )
             .await;
         }
 
-        self.tick_sleep
-            .as_mut()
-            .reset(self.current_tick.next().goal_time().to_instant(self.epoch));
+        self.last_completed_tick_id = tick_id;
     }
 }
 
@@ -421,16 +645,43 @@ async fn send_game_data<Addr: AddrBound>(
 struct SpawnContext<'a> {
     world: &'a mut World,
     net_ids: &'a mut NetIdAllocator,
+    entities_by_net_id: &'a mut EntitiesByNetIdResource,
 }
 
 impl<'a> SpawnContext<'a> {
-    fn spawn_static_model(&mut self, name: &str, transform: Isometry3<f32>) {
+    fn spawn_static_model(&mut self, name: &str, transform: Isometry<f32>) {
         let net_id = self.net_ids.next();
-        self.world
-            .spawn()
-            .insert(Synchronized { net_id })
-            .insert(TransformComponent(transform))
-            .insert(RenderComponent::new(name))
-            .insert(PhysicsComponent::new_static(format!("{name}_col")));
+        self.entities_by_net_id.0.insert(
+            net_id,
+            self.world
+                .spawn()
+                .insert(SynchronizedComponent {
+                    net_id,
+                    authority: Authority::Server,
+                })
+                .insert(TransformComponent(transform))
+                .insert(RenderComponent::new(name))
+                .insert(PhysicsComponent::new_static(format!("{name}_col")))
+                .id(),
+        );
+    }
+}
+
+enum PlayerEvent {
+    SendAssignment { player_id: PlayerId },
+}
+
+impl<Addr> PlayerState<Addr> {
+    async fn wait_for_event(&mut self, player_id: PlayerId) -> PlayerEvent {
+        let send_assignment = match &mut self.send_assignment {
+            Some(send_assignment) => send_assignment.tick().left_future(),
+            None => pending().right_future(),
+        };
+
+        select! {
+            biased;
+
+            _ = send_assignment => PlayerEvent::SendAssignment { player_id },
+        }
     }
 }
