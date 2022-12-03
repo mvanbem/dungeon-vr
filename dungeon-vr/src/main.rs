@@ -422,7 +422,11 @@ fn main_loop<'a>(
                     SessionEvent::Start { local_player_id } => {
                         game.start_net_session(local_player_id)
                     }
-                    SessionEvent::Snapshot { tick_id, data } => game.handle_snapshot(tick_id, data),
+                    SessionEvent::Snapshot {
+                        tick_id,
+                        tick_interval,
+                        data,
+                    } => game.handle_snapshot(tick_id, tick_interval, data),
                     SessionEvent::Voice(_) => (),
                     SessionEvent::TimeSync {
                         client_epoch,

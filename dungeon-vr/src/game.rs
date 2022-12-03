@@ -250,7 +250,12 @@ impl Game {
         }
     }
 
-    pub fn handle_snapshot(&mut self, snapshot_tick_id: TickId, snapshot_data: Vec<u8>) {
+    pub fn handle_snapshot(
+        &mut self,
+        snapshot_tick_id: TickId,
+        tick_interval: Duration,
+        snapshot_data: Vec<u8>,
+    ) {
         let net = self.net.as_mut().unwrap();
 
         // Reject snapshots that don't advance time.
@@ -258,6 +263,9 @@ impl Game {
         {
             return;
         }
+
+        // Accept the server's tick interval assignment.
+        self.tick.tick_interval = tick_interval;
 
         // Go directly to the new snapshot.
         let mut r = snapshot_data.as_slice();

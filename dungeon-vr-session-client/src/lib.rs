@@ -98,6 +98,7 @@ pub enum Event {
     },
     Snapshot {
         tick_id: TickId,
+        tick_interval: Duration,
         data: Vec<u8>,
     },
     Voice(Vec<u8>),
@@ -280,6 +281,7 @@ impl InnerClient {
                 &self.events,
                 Event::Snapshot {
                     tick_id: packet.tick_id,
+                    tick_interval: packet.tick_interval,
                     data: packet.serialized_game_state,
                 },
             )

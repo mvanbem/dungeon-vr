@@ -292,16 +292,11 @@ impl<Addr: AddrBound> InnerServer<Addr> {
 
     async fn run(mut self) {
         while !self.cancel_token.is_cancelled() {
-            let mut dynamic_events =
-                FuturesUnordered::from_iter(self.players.iter_mut().enumerate().filter_map(
-                    |(index, player)| {
-                        player.as_mut().map(move |player| async move {
-                            Event::PlayerEvent(
-                                player.wait_for_event(PlayerId::from_index(index)).await,
-                            )
-                        })
-                    },
-                ));
+            let mut dynamic_events = FuturesUnordered::from_iter(
+                iter_players_mut(&mut self.players).map(|(player_id, player)| async move {
+                    Event::PlayerEvent(player.wait_for_event(player_id).await)
+                }),
+            );
 
             let event = select! {
                 biased;
@@ -590,11 +585,9 @@ impl<Addr: AddrBound> InnerServer<Addr> {
         // Gather the current committed actions for this tick from each player.
         self.world.insert_resource(AllActionsResource({
             let mut all_actions = HashMap::new();
-            for (index, player) in self.players.iter().enumerate() {
-                if let Some(player) = player {
-                    if let Some(actions) = player.actions_by_tick_id.get(&tick_id) {
-                        all_actions.insert(PlayerId::from_index(index), actions.clone());
-                    }
+            for (player_id, player) in iter_players(&self.players) {
+                if let Some(actions) = player.actions_by_tick_id.get(&tick_id) {
+                    all_actions.insert(player_id, actions.clone());
                 }
             }
             all_actions
@@ -615,11 +608,30 @@ impl<Addr: AddrBound> InnerServer<Addr> {
             w
         };
         for player in self.players.iter().flatten() {
+            const GOAL_BUFFER_SIZE: i32 = 3;
+
+            let highest_buffered_tick_id = player
+                .actions_by_tick_id
+                .keys()
+                .next_back()
+                .copied()
+                .unwrap_or(tick_id);
+            let buffer_size = highest_buffered_tick_id.0.saturating_sub(tick_id.0) as i32;
+            let error = buffer_size - GOAL_BUFFER_SIZE;
+
+            // Compute the tick rate that would resolve the error over the next 10 seconds.
+            let tick_rate = 1.0 / TICK_INTERVAL.as_secs_f64() - error as f64 / 10.0;
+            let tick_interval = Duration::from_secs_f64(1.0 / tick_rate);
+            log::debug!(
+                "Input buffer size {buffer_size}; assigning client tick interval {tick_interval:?}",
+            );
+
             send_game_data(
                 &self.connection_requests,
                 player.addr,
                 Packet::GameState(GameStatePacket {
                     tick_id,
+                    tick_interval,
                     serialized_game_state: snapshot.clone(),
                 }),
             )
@@ -628,6 +640,29 @@ impl<Addr: AddrBound> InnerServer<Addr> {
 
         self.last_completed_tick_id = tick_id;
     }
+}
+
+fn iter_players<Addr>(
+    players: &Vec<Option<PlayerState<Addr>>>,
+) -> impl Iterator<Item = (PlayerId, &PlayerState<Addr>)> {
+    players.iter().enumerate().filter_map(|(index, player)| {
+        player
+            .as_ref()
+            .map(|player| (PlayerId::from_index(index), player))
+    })
+}
+
+fn iter_players_mut<Addr>(
+    players: &mut Vec<Option<PlayerState<Addr>>>,
+) -> impl Iterator<Item = (PlayerId, &mut PlayerState<Addr>)> {
+    players
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(index, player)| {
+            player
+                .as_mut()
+                .map(|player| (PlayerId::from_index(index), player))
+        })
 }
 
 async fn send_game_data<Addr: AddrBound>(
