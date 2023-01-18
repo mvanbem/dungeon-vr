@@ -213,7 +213,7 @@ impl<Addr: AddrBound> InnerServer<Addr> {
                 .id(),
         );
 
-        // Spawn a grabbable key.
+        // Spawn a few grabbable keys.
         let net_id = net_ids.next();
         entities_by_net_id.0.insert(
             net_id,
@@ -224,6 +224,40 @@ impl<Addr: AddrBound> InnerServer<Addr> {
                     authority: Authority::Server,
                 })
                 .insert(TransformComponent(vector![0.0, 1.0, 0.0].into()))
+                .insert(RenderComponent::new("LowPolyDungeon/Key_Silver"))
+                .insert(GrabbableComponent { grabbed: false })
+                .insert(PhysicsComponent::new_dynamic_ccd(
+                    "LowPolyDungeon/Key_Silver",
+                ))
+                .id(),
+        );
+        let net_id = net_ids.next();
+        entities_by_net_id.0.insert(
+            net_id,
+            world
+                .spawn()
+                .insert(SynchronizedComponent {
+                    net_id,
+                    authority: Authority::Server,
+                })
+                .insert(TransformComponent(vector![0.5, 1.0, 0.0].into()))
+                .insert(RenderComponent::new("LowPolyDungeon/Key_Silver"))
+                .insert(GrabbableComponent { grabbed: false })
+                .insert(PhysicsComponent::new_dynamic_ccd(
+                    "LowPolyDungeon/Key_Silver",
+                ))
+                .id(),
+        );
+        let net_id = net_ids.next();
+        entities_by_net_id.0.insert(
+            net_id,
+            world
+                .spawn()
+                .insert(SynchronizedComponent {
+                    net_id,
+                    authority: Authority::Server,
+                })
+                .insert(TransformComponent(vector![0.0, 1.0, 0.5].into()))
                 .insert(RenderComponent::new("LowPolyDungeon/Key_Silver"))
                 .insert(GrabbableComponent { grabbed: false })
                 .insert(PhysicsComponent::new_dynamic_ccd(

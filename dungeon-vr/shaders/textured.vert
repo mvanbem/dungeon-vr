@@ -7,6 +7,7 @@ layout(set = 0, binding = 0) uniform Matrices {
 
 layout(push_constant) uniform Constants {
     mat4 model;
+    vec4 color;
 } push_constants;
 
 layout(location = 0) in vec3 a_position;
@@ -15,6 +16,7 @@ layout(location = 2) in vec2 a_texcoord;
 
 layout(location = 0) out vec3 v_normal;
 layout(location = 1) out vec2 v_texcoord;
+layout(location = 2) out vec4 v_color;
 
 void main()  {
     gl_Position = u_matrices.viewProj[gl_ViewIndex]
@@ -22,4 +24,5 @@ void main()  {
         * vec4(a_position, 1.0);
     v_normal = (push_constants.model * vec4(a_normal, 0.0)).xyz;
     v_texcoord = a_texcoord;
+    v_color = push_constants.color;
 }

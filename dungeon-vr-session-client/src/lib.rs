@@ -230,29 +230,29 @@ impl InnerClient {
         let round_trip_time = now - packet.client_time;
         self.round_trip_time = Some(match self.round_trip_time {
             Some(prev) => {
-                let next = 0.9 * prev + 0.1 * round_trip_time.to_micros() as f64;
-                log::debug!("Time sync: Adjusting RTT from {prev} us to {next} us");
+                let next = 0.9 * prev + 0.1 * round_trip_time.to_nanos() as f64;
+                log::debug!("Time sync: Adjusting RTT from {prev} us to {next} ns");
                 next
             }
             None => {
-                let next = round_trip_time.to_micros() as f64;
-                log::debug!("Time sync: Initial RTT is {next} us");
+                let next = round_trip_time.to_nanos() as f64;
+                log::debug!("Time sync: Initial RTT is {next} ns");
                 next
             }
         });
 
         let midpoint = packet.client_time + round_trip_time / 2;
-        let client_time_to_server_time = packet.server_time.to_micros_since_epoch() as f64
-            - midpoint.to_micros_since_epoch() as f64;
+        let client_time_to_server_time = packet.server_time.to_nanos_since_epoch() as f64
+            - midpoint.to_nanos_since_epoch() as f64;
         self.client_time_to_server_time = Some(match self.client_time_to_server_time {
             Some(prev) => {
                 let next = 0.9 * prev + 0.1 * client_time_to_server_time;
-                log::debug!("Time sync: Adjusting offset from {prev} us to {next} us");
+                log::debug!("Time sync: Adjusting offset from {prev} ns to {next} ns");
                 next
             }
             None => {
                 let next = client_time_to_server_time;
-                log::debug!("Time sync: Initial offset is {next} us");
+                log::debug!("Time sync: Initial offset is {next} ns");
                 next
             }
         });
@@ -262,10 +262,10 @@ impl InnerClient {
                 &self.events,
                 Event::TimeSync {
                     client_epoch: self.epoch,
-                    round_trip_time: ClientOffset::from_micros(
+                    round_trip_time: ClientOffset::from_nanos(
                         self.round_trip_time.unwrap().round() as i64,
                     ),
-                    offset: ClientTimeToServerTime::from_micros(
+                    offset: ClientTimeToServerTime::from_nanos(
                         self.client_time_to_server_time.unwrap().round() as i64,
                     )
                     .into(),

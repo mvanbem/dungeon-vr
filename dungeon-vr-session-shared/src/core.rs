@@ -3,6 +3,7 @@ use std::num::{NonZeroU32, NonZeroU8};
 
 use bevy_ecs::prelude::*;
 use dungeon_vr_stream_codec::{ReadError, StreamCodec};
+use rapier3d::na::Vector4;
 use rapier3d::prelude::*;
 use thiserror::Error;
 
@@ -41,6 +42,21 @@ impl StreamCodec for NetId {
 pub enum Authority {
     Server,
     Player(PlayerId),
+}
+
+impl Authority {
+    pub fn to_color(self) -> Vector4<f32> {
+        match self {
+            Self::Server => Vector4::new(1.0, 1.0, 1.0, 1.0),
+            Self::Player(player_id) => match player_id.0.get() {
+                1 => Vector4::new(1.0, 0.5, 0.5, 1.0),
+                2 => Vector4::new(0.5, 0.5, 1.0, 1.0),
+                3 => Vector4::new(1.0, 1.0, 0.5, 1.0),
+                4 => Vector4::new(0.5, 1.0, 0.5, 1.0),
+                _ => Vector4::new(0.5, 1.0, 1.0, 1.0),
+            },
+        }
+    }
 }
 
 impl StreamCodec for Authority {

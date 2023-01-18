@@ -16,8 +16,8 @@ use dungeon_vr_session_client::{Event as SessionEvent, Request as SessionRequest
 use dungeon_vr_socket::fakelag::FakeLagConnectedSocket;
 use dungeon_vr_socket::ConnectedSocket;
 use openxr as xr;
-use rapier3d::na as nalgebra;
 use rapier3d::na::{self, matrix, vector, Matrix4};
+use rapier3d::na::{self as nalgebra, Vector4};
 use slotmap::Key;
 use tokio::net::UdpSocket;
 
@@ -437,10 +437,16 @@ fn main_loop<'a>(
             }
         }
         let UpdateResult {
-            model_transforms,
+            model_transform_colors,
             actions_committed,
             owned_transforms,
-        } = game.update(vk, render, material_assets, model_assets);
+        } = game.update(
+            vk,
+            render,
+            material_assets,
+            model_assets,
+            xr_frame_state.predicted_display_time,
+        );
 
         // Pass newly committed actions to the session.
         if let Some(session) = session.as_deref_mut() {
@@ -455,14 +461,14 @@ fn main_loop<'a>(
         }
 
         // Group primitive instances.
-        let mut transforms_by_primitive_by_material: HashMap<
+        let mut transform_colors_by_primitive_by_material: HashMap<
             MaterialHandle,
-            HashMap<RefEq<Primitive>, Vec<Matrix4<f32>>>,
+            HashMap<RefEq<Primitive>, Vec<(Matrix4<f32>, Vector4<f32>)>>,
         > = Default::default();
-        for (model_key, transforms) in model_transforms {
+        for (model_key, transforms) in model_transform_colors {
             let model = model_assets.get(model_key);
             for primitive in &model.primitives {
-                transforms_by_primitive_by_material
+                transform_colors_by_primitive_by_material
                     .entry(primitive.material)
                     .or_default()
                     .entry(RefEq(primitive))
@@ -472,7 +478,9 @@ fn main_loop<'a>(
         }
 
         // Draw all primitives.
-        for (material_key, transforms_by_primitive) in transforms_by_primitive_by_material {
+        for (material_key, transform_colors_by_primitive) in
+            transform_colors_by_primitive_by_material
+        {
             let pipeline_layout = if material_key.is_null() {
                 unsafe {
                     vk.device().cmd_bind_pipeline(
@@ -501,7 +509,7 @@ fn main_loop<'a>(
                 render.textured_pipeline_layout
             };
 
-            for (RefEq(primitive), transforms) in transforms_by_primitive {
+            for (RefEq(primitive), transform_colors) in transform_colors_by_primitive {
                 unsafe {
                     vk.device()
                         .cmd_bind_vertex_buffers(cmd, 0, &[primitive.vertex_buffer], &[0]);
@@ -512,7 +520,7 @@ fn main_loop<'a>(
                         primitive.index_type,
                     );
                 }
-                for model in &transforms {
+                for (model, color) in &transform_colors {
                     unsafe {
                         vk.device().cmd_push_constants(
                             cmd,
@@ -521,6 +529,7 @@ fn main_loop<'a>(
                             0,
                             bytemuck::bytes_of(&PushConstants {
                                 model: *model.as_ref(),
+                                color: *color.as_ref(),
                             }),
                         );
                         vk.device()
@@ -621,6 +630,7 @@ fn main_loop<'a>(
 #[repr(C)]
 struct PushConstants {
     model: [[f32; 4]; 4],
+    color: [f32; 4],
 }
 
 const NOOP_STENCIL_STATE: vk::StencilOpState = vk::StencilOpState {
