@@ -419,20 +419,20 @@ fn main_loop<'a>(
         if let Some(session) = session.as_deref_mut() {
             while let Some(event) = session.try_recv_event() {
                 match event {
-                    SessionEvent::Start { local_player_id } => {
-                        game.start_net_session(local_player_id)
-                    }
+                    SessionEvent::Start {
+                        local_player_id,
+                        tick_id,
+                    } => game.start_net_session(
+                        xr_frame_state.predicted_display_time,
+                        local_player_id,
+                        tick_id,
+                    ),
                     SessionEvent::Snapshot {
                         tick_id,
                         tick_interval,
                         data,
                     } => game.handle_snapshot(tick_id, tick_interval, data),
                     SessionEvent::Voice(_) => (),
-                    SessionEvent::TimeSync {
-                        client_epoch,
-                        round_trip_time,
-                        offset,
-                    } => game.handle_time_sync(client_epoch, round_trip_time, offset),
                 }
             }
         }

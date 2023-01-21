@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::pending;
-use std::time::Duration;
 
 use dungeon_vr_connection_client::{
     ConnectionState, Event as ConnectionEvent, Request as ConnectionRequest,
@@ -15,19 +14,19 @@ use dungeon_vr_session_shared::packet::pong_packet::PongPacket;
 use dungeon_vr_session_shared::packet::update_owned_transforms_packet::UpdateOwnedTransformsPacket;
 use dungeon_vr_session_shared::packet::voice_packet::VoicePacket;
 use dungeon_vr_session_shared::packet::Packet;
-use dungeon_vr_session_shared::time::{
-    ClientEpoch, ClientOffset, ClientTimeToServerTime, LocalEpoch,
-};
+use dungeon_vr_session_shared::time::{ClientTime, ClientTokioEpoch, NanoDuration, TokioEpoch};
 use dungeon_vr_session_shared::{PlayerId, TickId};
 use dungeon_vr_stream_codec::StreamCodec;
-use futures::FutureExt;
 use rapier3d::prelude::*;
 use tokio::select;
 use tokio::sync::mpsc;
-use tokio::time::{interval, Interval};
+use tokio::time::sleep_until;
 
 const EVENT_BUFFER_SIZE: usize = 256;
 const REQUEST_BUFFER_SIZE: usize = 256;
+const PING_INTERVAL: NanoDuration = NanoDuration::from_nanos(100_000_000);
+const PING_SAMPLES: usize = 10;
+const INITIAL_SLACK: NanoDuration = NanoDuration::from_nanos(100_000_000);
 
 pub struct SessionClient {
     _cancel_guard: cancel::Guard,
@@ -37,8 +36,8 @@ pub struct SessionClient {
 
 enum InternalEvent {
     Connection(Option<ConnectionEvent>),
+    State(StateEvent),
     Request(Option<Request>),
-    TimeSync,
 }
 
 impl SessionClient {
@@ -85,28 +84,58 @@ struct InnerClient {
     connection_events: mpsc::Receiver<ConnectionEvent>,
     events: mpsc::Sender<Event>,
     requests: mpsc::Receiver<Request>,
-    epoch: ClientEpoch,
-    started: bool,
-    time_sync: Option<Interval>,
-    round_trip_time: Option<f64>,
-    client_time_to_server_time: Option<f64>,
+    epoch: ClientTokioEpoch,
+    state: State,
+}
+
+#[derive(Debug)]
+enum State {
+    AwaitingConnection,
+    MeasuringPing {
+        local_player_id: Option<PlayerId>,
+        next_ping_time: ClientTime,
+        rtt_samples: Vec<NanoDuration>,
+        server_last_completed_tick: Option<TickId>,
+        server_tick_interval: Option<NanoDuration>,
+    },
+    Running,
+}
+
+enum StateEvent {
+    PingElapsed,
+}
+
+impl State {
+    async fn event(&mut self, epoch: &ClientTokioEpoch) -> StateEvent {
+        match self {
+            Self::AwaitingConnection => pending().await,
+            Self::MeasuringPing {
+                local_player_id,
+                next_ping_time,
+                rtt_samples,
+                server_last_completed_tick,
+                server_tick_interval,
+            } => {
+                // TODO: Use select!{} and enforce a timeout.
+                sleep_until(epoch.instant_at(*next_ping_time)).await;
+                StateEvent::PingElapsed
+            }
+            Self::Running => pending().await,
+        }
+    }
 }
 
 pub enum Event {
     Start {
         local_player_id: PlayerId,
+        tick_id: TickId,
     },
     Snapshot {
         tick_id: TickId,
-        tick_interval: Duration,
+        tick_interval: NanoDuration,
         data: Vec<u8>,
     },
     Voice(Vec<u8>),
-    TimeSync {
-        client_epoch: ClientEpoch,
-        round_trip_time: ClientOffset,
-        offset: ClientTimeToServerTime,
-    },
 }
 
 pub enum Request {
@@ -123,26 +152,21 @@ impl InnerClient {
         events: mpsc::Sender<Event>,
         requests: mpsc::Receiver<Request>,
     ) -> Self {
+        log::info!("Session state: awaiting connection");
         Self {
             cancel_token: cancel_token.clone(),
             connection_requests,
             connection_events,
             events,
             requests,
-            epoch: LocalEpoch::new(),
-            started: false,
-            time_sync: None,
-            round_trip_time: None,
-            client_time_to_server_time: None,
+            epoch: TokioEpoch::new(),
+            state: State::AwaitingConnection,
         }
     }
 
     async fn run(mut self) {
         while !self.cancel_token.is_cancelled() {
-            let time_sync = match self.time_sync.as_mut() {
-                Some(time_sync) => time_sync.tick().left_future(),
-                None => pending().right_future(),
-            };
+            let state_event = self.state.event(&self.epoch);
 
             let event = select! {
                 biased;
@@ -151,16 +175,15 @@ impl InnerClient {
 
                 event = self.connection_events.recv() => InternalEvent::Connection(event),
 
+                event = state_event => InternalEvent::State(event),
+
                 request = self.requests.recv() => InternalEvent::Request(request),
-
-                _ = time_sync => InternalEvent::TimeSync,
-
             };
 
             match event {
                 InternalEvent::Connection(event) => self.handle_connection_event(event).await,
+                InternalEvent::State(event) => self.handle_state_event(event).await,
                 InternalEvent::Request(request) => self.handle_request(request).await,
-                InternalEvent::TimeSync => self.handle_time_sync().await,
             }
         }
 
@@ -192,7 +215,15 @@ impl InnerClient {
             ConnectionState::Connecting => (),
             ConnectionState::Responding => (),
             ConnectionState::Connected => {
-                self.time_sync = Some(interval(Duration::from_secs(10)));
+                assert!(matches!(self.state, State::AwaitingConnection));
+                log::info!("Session state: measuring ping");
+                self.state = State::MeasuringPing {
+                    local_player_id: None,
+                    next_ping_time: self.epoch.now() + PING_INTERVAL,
+                    rtt_samples: Vec::new(),
+                    server_last_completed_tick: None,
+                    server_tick_interval: None,
+                };
             }
         }
     }
@@ -226,57 +257,26 @@ impl InnerClient {
     }
 
     async fn handle_pong_packet(&mut self, packet: PongPacket) {
-        let now = self.epoch.now();
-        let round_trip_time = now - packet.client_time;
-        self.round_trip_time = Some(match self.round_trip_time {
-            Some(prev) => {
-                let next = 0.9 * prev + 0.1 * round_trip_time.to_nanos() as f64;
-                log::debug!("Time sync: Adjusting RTT from {prev} us to {next} ns");
-                next
-            }
-            None => {
-                let next = round_trip_time.to_nanos() as f64;
-                log::debug!("Time sync: Initial RTT is {next} ns");
-                next
-            }
-        });
+        if let State::MeasuringPing {
+            rtt_samples,
+            server_last_completed_tick,
+            server_tick_interval,
+            ..
+        } = &mut self.state
+        {
+            let now = self.epoch.now();
+            let round_trip_time = now - packet.client_time;
 
-        let midpoint = packet.client_time + round_trip_time / 2;
-        let client_time_to_server_time = packet.server_time.to_nanos_since_epoch() as f64
-            - midpoint.to_nanos_since_epoch() as f64;
-        self.client_time_to_server_time = Some(match self.client_time_to_server_time {
-            Some(prev) => {
-                let next = 0.9 * prev + 0.1 * client_time_to_server_time;
-                log::debug!("Time sync: Adjusting offset from {prev} ns to {next} ns");
-                next
-            }
-            None => {
-                let next = client_time_to_server_time;
-                log::debug!("Time sync: Initial offset is {next} ns");
-                next
-            }
-        });
-
-        if self.started {
-            send_event(
-                &self.events,
-                Event::TimeSync {
-                    client_epoch: self.epoch,
-                    round_trip_time: ClientOffset::from_nanos(
-                        self.round_trip_time.unwrap().round() as i64,
-                    ),
-                    offset: ClientTimeToServerTime::from_nanos(
-                        self.client_time_to_server_time.unwrap().round() as i64,
-                    )
-                    .into(),
-                },
-            )
-            .await;
+            rtt_samples.push(round_trip_time);
+            *server_last_completed_tick = Some(packet.server_last_completed_tick);
+            *server_tick_interval = Some(packet.server_tick_interval);
+        } else {
+            log::warn!("Dropping unexpected pong packet")
         }
     }
 
     async fn handle_game_state_packet(&mut self, packet: GameStatePacket) {
-        if self.started {
+        if matches!(self.state, State::Running) {
             send_event(
                 &self.events,
                 Event::Snapshot {
@@ -286,6 +286,8 @@ impl InnerClient {
                 },
             )
             .await;
+        } else {
+            log::warn!("Dropping unexpected game state packet");
         }
     }
 
@@ -294,23 +296,80 @@ impl InnerClient {
     }
 
     async fn handle_player_assignment_packet(&mut self, packet: PlayerAssignmentPacket) {
-        if self.started {
-            return;
+        if let State::MeasuringPing {
+            local_player_id: local_player_id @ None,
+            ..
+        } = &mut self.state
+        {
+            log::info!("Accepted player assignment: {}", packet.player_id);
+            *local_player_id = Some(packet.player_id);
         }
-
-        log::info!("Player assignment received: {}", packet.player_id);
-        self.started = true;
-        send_event(
-            &self.events,
-            Event::Start {
-                local_player_id: packet.player_id,
-            },
-        )
-        .await;
     }
 
     fn handle_connection_dropped(&mut self) {
         todo!()
+    }
+
+    async fn handle_state_event(&mut self, event: StateEvent) {
+        match &mut self.state {
+            State::AwaitingConnection => unreachable!(),
+            State::MeasuringPing {
+                local_player_id,
+                next_ping_time,
+                rtt_samples,
+                server_last_completed_tick,
+                server_tick_interval,
+            } => match event {
+                StateEvent::PingElapsed => {
+                    if rtt_samples.len() >= PING_SAMPLES {
+                        let server_tick_interval = server_tick_interval.unwrap();
+
+                        // Compute an RTT estimate, add a fixed amount of slack, and convert that to
+                        // a tick ID. This should be close to where the server will be trying to
+                        // maintain our sync point.
+                        let rtt = rtt_samples.iter().copied().sum::<NanoDuration>()
+                            / rtt_samples.len() as i64;
+                        let ticks_ahead =
+                            (rtt + INITIAL_SLACK + server_tick_interval / 2) / server_tick_interval;
+                        let tick_id = TickId(
+                            server_last_completed_tick
+                                .unwrap()
+                                .0
+                                .wrapping_add(ticks_ahead as u32),
+                        );
+
+                        log::info!(
+                            "Initial RTT estimate {} ns; starting at tick {}",
+                            rtt.as_nanos(),
+                            tick_id.0,
+                        );
+                        send_event(
+                            &self.events,
+                            Event::Start {
+                                local_player_id: local_player_id.unwrap(),
+                                tick_id,
+                            },
+                        )
+                        .await;
+
+                        log::info!("Session state: running");
+                        self.state = State::Running;
+                    } else {
+                        // Need more samples. There may already be enough packets in flight, but
+                        // send another ping.
+                        *next_ping_time += PING_INTERVAL;
+                        send_packet(
+                            &self.connection_requests,
+                            Packet::Ping(PingPacket {
+                                client_time: self.epoch.now(),
+                            }),
+                        )
+                        .await;
+                    }
+                }
+            },
+            State::Running => unreachable!(),
+        }
     }
 
     async fn handle_request(&mut self, request: Option<Request>) {
@@ -343,17 +402,6 @@ impl InnerClient {
                 .await;
             }
         }
-    }
-
-    async fn handle_time_sync(&mut self) {
-        log::debug!("Requesting time sync");
-        send_packet(
-            &self.connection_requests,
-            Packet::Ping(PingPacket {
-                client_time: self.epoch.now(),
-            }),
-        )
-        .await;
     }
 }
 

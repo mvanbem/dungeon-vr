@@ -14,12 +14,12 @@ impl StreamCodec for PingPacket {
     type WriteError = Infallible;
 
     fn read_from(r: &mut &[u8]) -> Result<Self, ReadPacketError> {
-        let client_time = ClientTime::from_nanos_since_epoch(u64::read_from(r)?);
+        let client_time = ClientTime::from_nanos_since_epoch(i64::read_from(r)?);
         Ok(Self { client_time })
     }
 
     fn write_to(&self, w: &mut Vec<u8>) -> Result<(), Infallible> {
-        self.client_time.to_nanos_since_epoch().write_to(w)?;
+        self.client_time.as_nanos_since_epoch().write_to(w)?;
         Ok(())
     }
 }

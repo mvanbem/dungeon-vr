@@ -3,13 +3,13 @@
 use std::convert::Infallible;
 use std::fmt::{self, Display, Formatter};
 use std::num::NonZeroU8;
-use std::time::Duration;
 
 use bevy_ecs::prelude::Component;
 use dungeon_vr_stream_codec::{ReadError, StreamCodec};
 use thiserror::Error;
 
 use crate::physics::PhysicsResource;
+use crate::time::NanoDuration;
 
 pub mod action;
 pub mod collider_cache;
@@ -23,7 +23,7 @@ pub mod resources;
 pub mod snapshot;
 pub mod time;
 
-pub const TICK_INTERVAL: Duration = Duration::from_millis(50); // 20 Hz
+pub const TICK_INTERVAL: NanoDuration = NanoDuration::from_nanos(50_000_000); // 20 Hz
 
 /// A small nonzero integer identifying a player currently connected to a game. A player's ID does
 /// not change while they are connected.

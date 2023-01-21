@@ -3,7 +3,6 @@ use std::f32::consts::PI;
 use std::mem::{replace, take};
 use std::num::NonZeroU8;
 use std::sync::Mutex;
-use std::time::Duration;
 
 use bevy_ecs::prelude::*;
 use dungeon_vr_session_shared::action::{apply_actions, Action};
@@ -20,9 +19,7 @@ use dungeon_vr_session_shared::physics::{
 use dungeon_vr_session_shared::render::{ModelHandle, RenderComponent};
 use dungeon_vr_session_shared::resources::{AllActionsResource, EntitiesByNetIdResource};
 use dungeon_vr_session_shared::snapshot::apply_snapshot;
-use dungeon_vr_session_shared::time::{
-    ClientEpoch, ClientOffset, ClientTimeToServerTime, LocalTime, TimeOffset,
-};
+use dungeon_vr_session_shared::time::{NanoDuration, NanoTime};
 use dungeon_vr_session_shared::{PlayerId, TickId, TICK_INTERVAL};
 use itertools::{merge_join_by, EitherOrBoth};
 use ordered_float::NotNan;
@@ -37,8 +34,7 @@ use crate::vk_handles::VkHandles;
 #[derive(Clone, Copy)]
 pub struct XrMarker;
 
-type XrTime = LocalTime<XrMarker>;
-type XrOffset = TimeOffset<XrMarker, XrMarker>;
+type XrTime = NanoTime<XrMarker>;
 
 struct VrTrackingState {
     current: VrTracking,
@@ -79,19 +75,11 @@ struct GameNet {
     latest: Option<AuthoritativeState>,
     local_actions: BTreeMap<TickId, Vec<Action>>,
     action_accumulator: Vec<Action>,
-    time_sync: Option<TimeSync>,
 }
 
 struct AuthoritativeState {
     tick_id: TickId,
     snapshot: Vec<u8>,
-}
-
-#[derive(Clone, Copy)]
-struct TimeSync {
-    client_epoch: ClientEpoch,
-    round_trip_time: ClientOffset,
-    offset: ClientTimeToServerTime,
 }
 
 struct GameTick {
@@ -102,12 +90,12 @@ struct GameTick {
     next_tick_time: Option<XrTime>,
     /// The current tick interval, which is nominally [`TICK_INTERVAL`], but varies under server
     /// control to maintain a desired action buffer size.
-    tick_interval: XrOffset,
+    tick_interval: NanoDuration,
 }
 
 struct GameRender {
     start_time: XrTime,
-    tick_interval: XrOffset,
+    duration: NanoDuration,
     snapshots: [RenderSnapshot; 2],
 }
 
@@ -132,9 +120,14 @@ impl GameRender {
     /// If a post is early, the interpolation parameter will jump from some value less than one to
     /// zero and the player may see a discontinuity where time is lost. If a post is late, the
     /// interpolation parameter will saturate at one and the player may see time stop.
-    fn post_at(&mut self, start_time: XrTime, tick_interval: XrOffset, snapshot: RenderSnapshot) {
+    fn post_at(
+        &mut self,
+        start_time: XrTime,
+        tick_interval: NanoDuration,
+        snapshot: RenderSnapshot,
+    ) {
         self.start_time = start_time;
-        self.tick_interval = tick_interval;
+        self.duration = tick_interval;
         self.snapshots[0] = replace(&mut self.snapshots[1], snapshot);
     }
 
@@ -142,7 +135,7 @@ impl GameRender {
         &self,
         time: XrTime,
     ) -> SecondaryMap<ModelHandle, Vec<(Matrix4<f32>, Vector4<f32>)>> {
-        let t = ((time - self.start_time).to_nanos() as f32 / self.tick_interval.to_nanos() as f32)
+        let t = ((time - self.start_time).as_nanos() as f32 / self.duration.as_nanos() as f32)
             .clamp(0.0, 1.0);
 
         let mut result: SecondaryMap<_, Vec<_>> = Default::default();
@@ -285,29 +278,37 @@ impl Game {
             tick: GameTick {
                 last_completed_tick_id: TickId(0),
                 next_tick_time: None,
-                tick_interval: XrOffset::from_nanos(TICK_INTERVAL.as_nanos() as i64),
+                tick_interval: TICK_INTERVAL,
             },
             render: Mutex::new(GameRender {
                 start_time: XrTime::from_nanos_since_epoch(0),
-                tick_interval: XrOffset::from_nanos(1),
+                duration: NanoDuration::from_nanos(1),
                 snapshots: Default::default(),
             }),
             prev_vr_tracking: VrTracking::default(),
         }
     }
 
-    pub fn start_net_session(&mut self, local_player_id: PlayerId) {
-        log::info!("Starting net session");
+    pub fn start_net_session(
+        &mut self,
+        now: openxr::Time,
+        local_player_id: PlayerId,
+        tick_id: TickId,
+    ) {
+        log::info!("Configuring game for newly started session");
         assert!(self.net.is_none());
         self.net = Some(GameNet {
             local_player_id,
             latest: None,
             local_actions: BTreeMap::default(),
             action_accumulator: Vec::new(),
-            time_sync: None,
         });
         self.ecs.world.resource_mut::<LocalAuthorityResource>().0 =
             Some(Authority::Player(local_player_id));
+
+        self.tick.last_completed_tick_id = tick_id;
+        self.tick.next_tick_time = Some(XrTime::from_nanos_since_epoch(now.as_nanos()));
+        self.tick.tick_interval = TICK_INTERVAL;
 
         // Despawn any unsynchronized hands.
         let unsynchronized_hands = Vec::from_iter(
@@ -324,7 +325,7 @@ impl Game {
     pub fn handle_snapshot(
         &mut self,
         snapshot_tick_id: TickId,
-        tick_interval: Duration,
+        tick_interval: NanoDuration,
         snapshot_data: Vec<u8>,
     ) {
         let net = self.net.as_mut().unwrap();
@@ -337,7 +338,7 @@ impl Game {
 
         // Accept the server's tick interval assignment.
         self.tick.tick_interval =
-            XrOffset::from_nanos(tick_interval.as_nanos().try_into().unwrap());
+            tick_interval.clamp(TICK_INTERVAL * 9 / 10, TICK_INTERVAL * 11 / 10);
 
         // Go directly to the new snapshot.
         let mut r = snapshot_data.as_slice();
@@ -388,7 +389,7 @@ impl Game {
         predicted_display_time: openxr::Time,
     ) -> UpdateResult {
         let predicted_display_time =
-            XrTime::from_nanos_since_epoch(predicted_display_time.as_nanos().try_into().unwrap());
+            XrTime::from_nanos_since_epoch(predicted_display_time.as_nanos());
 
         // Capture local actions and predict their effects.
         let local_actions = self.ecs.get_local_actions();
@@ -463,19 +464,6 @@ impl Game {
             actions_committed,
             owned_transforms,
         }
-    }
-
-    pub fn handle_time_sync(
-        &mut self,
-        client_epoch: ClientEpoch,
-        round_trip_time: ClientOffset,
-        offset: ClientTimeToServerTime,
-    ) {
-        self.net.as_mut().unwrap().time_sync = Some(TimeSync {
-            client_epoch,
-            round_trip_time,
-            offset,
-        });
     }
 }
 

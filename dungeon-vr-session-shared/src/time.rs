@@ -1,30 +1,28 @@
 use std::cmp::Ordering;
+use std::iter::Sum;
 use std::marker::PhantomData;
+use std::num::TryFromIntError;
 use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Sub, SubAssign};
 
 use tokio::time::Instant;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct ServerMarker;
-pub type ServerEpoch = LocalEpoch<ServerMarker>;
-pub type ServerTime = LocalTime<ServerMarker>;
-pub type ServerOffset = TimeOffset<ServerMarker, ServerMarker>;
+pub type ServerTokioEpoch = TokioEpoch<ServerMarker>;
+pub type ServerTime = NanoTime<ServerMarker>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct ClientMarker;
-pub type ClientEpoch = LocalEpoch<ClientMarker>;
-pub type ClientTime = LocalTime<ClientMarker>;
-pub type ClientOffset = TimeOffset<ClientMarker, ClientMarker>;
-
-pub type ClientTimeToServerTime = TimeOffset<ClientMarker, ServerMarker>;
+pub type ClientTokioEpoch = TokioEpoch<ClientMarker>;
+pub type ClientTime = NanoTime<ClientMarker>;
 
 #[derive(Debug)]
-pub struct LocalEpoch<M> {
+pub struct TokioEpoch<M> {
     instant: Instant,
     _phantom_m: PhantomData<M>,
 }
 
-impl<M> Clone for LocalEpoch<M> {
+impl<M> Clone for TokioEpoch<M> {
     fn clone(&self) -> Self {
         Self {
             instant: self.instant,
@@ -33,9 +31,9 @@ impl<M> Clone for LocalEpoch<M> {
     }
 }
 
-impl<M> Copy for LocalEpoch<M> {}
+impl<M> Copy for TokioEpoch<M> {}
 
-impl<M> LocalEpoch<M> {
+impl<M> TokioEpoch<M> {
     pub fn new() -> Self {
         Self {
             instant: Instant::now(),
@@ -43,8 +41,8 @@ impl<M> LocalEpoch<M> {
         }
     }
 
-    pub fn now(self) -> LocalTime<M> {
-        LocalTime::from_nanos_since_epoch(
+    pub fn now(self) -> NanoTime<M> {
+        NanoTime::from_nanos_since_epoch(
             (Instant::now() - self.instant)
                 .as_nanos()
                 .try_into()
@@ -55,32 +53,33 @@ impl<M> LocalEpoch<M> {
     pub fn instant(self) -> Instant {
         self.instant
     }
+
+    pub fn instant_at(self, time: NanoTime<M>) -> Instant {
+        self.instant
+            + std::time::Duration::from_nanos(time.as_nanos_since_epoch().try_into().unwrap())
+    }
 }
 
 #[derive(Debug)]
-pub struct LocalTime<M> {
-    nanos: u64,
+pub struct NanoTime<M> {
+    nanos: i64,
     _phantom_m: PhantomData<M>,
 }
 
-impl<M> LocalTime<M> {
-    pub fn from_nanos_since_epoch(nanos: u64) -> Self {
+impl<M> NanoTime<M> {
+    pub fn from_nanos_since_epoch(nanos: i64) -> Self {
         Self {
             nanos,
             _phantom_m: PhantomData,
         }
     }
 
-    pub fn to_nanos_since_epoch(self) -> u64 {
+    pub fn as_nanos_since_epoch(self) -> i64 {
         self.nanos
-    }
-
-    pub fn to_instant(self, epoch: LocalEpoch<M>) -> Instant {
-        epoch.instant + std::time::Duration::from_micros(self.nanos)
     }
 }
 
-impl<M> Clone for LocalTime<M> {
+impl<M> Clone for NanoTime<M> {
     fn clone(&self) -> Self {
         Self {
             nanos: self.nanos,
@@ -89,120 +88,140 @@ impl<M> Clone for LocalTime<M> {
     }
 }
 
-impl<M> Copy for LocalTime<M> {}
+impl<M> Copy for NanoTime<M> {}
 
-impl<From, To> Add<TimeOffset<From, To>> for LocalTime<From> {
-    type Output = LocalTime<To>;
+impl<M> Add<NanoDuration> for NanoTime<M> {
+    type Output = Self;
 
-    fn add(self, rhs: TimeOffset<From, To>) -> LocalTime<To> {
-        LocalTime::from_nanos_since_epoch(self.nanos.checked_add_signed(rhs.nanos).unwrap())
+    fn add(self, rhs: NanoDuration) -> Self {
+        NanoTime::from_nanos_since_epoch(self.nanos.checked_add(rhs.nanos).unwrap())
     }
 }
 
-impl<M> AddAssign<TimeOffset<M, M>> for LocalTime<M> {
-    fn add_assign(&mut self, rhs: TimeOffset<M, M>) {
-        self.nanos = self.nanos.checked_add_signed(rhs.nanos).unwrap();
+impl<M> AddAssign<NanoDuration> for NanoTime<M> {
+    fn add_assign(&mut self, rhs: NanoDuration) {
+        self.nanos = self.nanos.checked_add(rhs.nanos).unwrap();
     }
 }
 
-impl<From, To> Sub<LocalTime<From>> for LocalTime<To> {
-    type Output = TimeOffset<From, To>;
+impl<M> Sub<NanoTime<M>> for NanoTime<M> {
+    type Output = NanoDuration;
 
-    fn sub(self, rhs: LocalTime<From>) -> TimeOffset<From, To> {
-        TimeOffset::from_nanos(
-            (i64::try_from(self.nanos).unwrap())
-                .checked_sub(i64::try_from(rhs.nanos).unwrap())
-                .unwrap(),
-        )
+    fn sub(self, rhs: Self) -> NanoDuration {
+        NanoDuration::from_nanos(self.nanos.checked_sub(rhs.nanos).unwrap())
     }
 }
 
-impl<M> PartialEq for LocalTime<M> {
+impl<M> PartialEq for NanoTime<M> {
     fn eq(&self, other: &Self) -> bool {
         self.nanos == other.nanos
     }
 }
 
-impl<M> Eq for LocalTime<M> {}
+impl<M> Eq for NanoTime<M> {}
 
-impl<M> PartialOrd for LocalTime<M> {
+impl<M> PartialOrd for NanoTime<M> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.nanos.partial_cmp(&other.nanos)
     }
 }
 
-impl<M> Ord for LocalTime<M> {
+impl<M> Ord for NanoTime<M> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.nanos.cmp(&other.nanos)
     }
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TimeOffset<From, To> {
+pub struct NanoDuration {
     nanos: i64,
-    _phantom_from: PhantomData<From>,
-    _phantom_to: PhantomData<To>,
 }
 
-impl<From, To> TimeOffset<From, To> {
-    pub fn from_nanos(nanos: i64) -> Self {
-        Self {
-            nanos,
-            _phantom_from: PhantomData,
-            _phantom_to: PhantomData,
-        }
+impl NanoDuration {
+    pub const fn from_nanos(nanos: i64) -> Self {
+        Self { nanos }
     }
 
-    pub fn to_nanos(self) -> i64 {
+    pub fn from_secs_f32(secs: f32) -> Self {
+        let nanos = (secs * 1e9).round();
+        // TODO: This check seems imprecise.
+        assert!(nanos >= i64::MIN as f32 && nanos <= i64::MAX as f32);
+        Self::from_nanos(nanos as i64)
+    }
+
+    pub fn from_secs_f64(secs: f64) -> Self {
+        let nanos = (secs * 1e9).round();
+        // TODO: This check seems imprecise.
+        assert!(nanos >= i64::MIN as f64 && nanos <= i64::MAX as f64);
+        Self::from_nanos(nanos as i64)
+    }
+
+    pub const fn as_nanos(self) -> i64 {
         self.nanos
     }
 
-    pub fn invert(&self) -> TimeOffset<To, From> {
-        TimeOffset::from_nanos(self.nanos.checked_neg().unwrap())
+    pub fn as_secs_f32(self) -> f32 {
+        self.nanos as f32 * 1e-9
+    }
+
+    pub fn as_secs_f64(self) -> f64 {
+        self.nanos as f64 * 1e-9
     }
 }
 
-impl<From, To> Clone for TimeOffset<From, To> {
+impl Clone for NanoDuration {
     fn clone(&self) -> Self {
-        Self {
-            nanos: self.nanos,
-            _phantom_from: PhantomData,
-            _phantom_to: PhantomData,
-        }
+        Self { nanos: self.nanos }
     }
 }
 
-impl<From, To> Copy for TimeOffset<From, To> {}
+impl Copy for NanoDuration {}
 
-impl<A, B, C> Add<TimeOffset<B, C>> for TimeOffset<A, B> {
-    type Output = TimeOffset<A, C>;
+impl TryFrom<std::time::Duration> for NanoDuration {
+    type Error = TryFromIntError;
 
-    fn add(self, rhs: TimeOffset<B, C>) -> TimeOffset<A, C> {
-        TimeOffset::from_nanos(self.nanos.checked_add(rhs.nanos).unwrap())
+    fn try_from(value: std::time::Duration) -> Result<Self, TryFromIntError> {
+        Ok(Self::from_nanos(value.as_nanos().try_into()?))
     }
 }
 
-impl<M> AddAssign for TimeOffset<M, M> {
+impl TryFrom<NanoDuration> for std::time::Duration {
+    type Error = TryFromIntError;
+
+    fn try_from(value: NanoDuration) -> Result<Self, TryFromIntError> {
+        Ok(std::time::Duration::from_nanos(value.nanos.try_into()?))
+    }
+}
+
+impl Add for NanoDuration {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self {
+        Self::from_nanos(self.nanos.checked_add(rhs.nanos).unwrap())
+    }
+}
+
+impl AddAssign for NanoDuration {
     fn add_assign(&mut self, rhs: Self) {
         self.nanos = self.nanos.checked_add(rhs.nanos).unwrap();
     }
 }
 
-impl<A, B, C> Sub<TimeOffset<C, B>> for TimeOffset<A, B> {
-    type Output = TimeOffset<A, C>;
+impl Sub for NanoDuration {
+    type Output = Self;
 
-    fn sub(self, rhs: TimeOffset<C, B>) -> TimeOffset<A, C> {
-        TimeOffset::from_nanos(self.nanos.checked_sub(rhs.nanos).unwrap())
+    fn sub(self, rhs: Self) -> Self {
+        Self::from_nanos(self.nanos.checked_sub(rhs.nanos).unwrap())
     }
 }
 
-impl<M> SubAssign for TimeOffset<M, M> {
+impl SubAssign for NanoDuration {
     fn sub_assign(&mut self, rhs: Self) {
         self.nanos = self.nanos.checked_sub(rhs.nanos).unwrap();
     }
 }
 
-impl<From, To> Mul<i64> for TimeOffset<From, To> {
+impl Mul<i64> for NanoDuration {
     type Output = Self;
 
     fn mul(self, rhs: i64) -> Self {
@@ -210,13 +229,13 @@ impl<From, To> Mul<i64> for TimeOffset<From, To> {
     }
 }
 
-impl<From, To> MulAssign<i64> for TimeOffset<From, To> {
+impl MulAssign<i64> for NanoDuration {
     fn mul_assign(&mut self, rhs: i64) {
         self.nanos *= rhs;
     }
 }
 
-impl<From, To> Div<i64> for TimeOffset<From, To> {
+impl Div<i64> for NanoDuration {
     type Output = Self;
 
     fn div(self, rhs: i64) -> Self {
@@ -224,8 +243,22 @@ impl<From, To> Div<i64> for TimeOffset<From, To> {
     }
 }
 
-impl<From, To> DivAssign<i64> for TimeOffset<From, To> {
+impl Div for NanoDuration {
+    type Output = i64;
+
+    fn div(self, rhs: Self) -> i64 {
+        self.nanos / rhs.nanos
+    }
+}
+
+impl DivAssign<i64> for NanoDuration {
     fn div_assign(&mut self, rhs: i64) {
         self.nanos /= rhs;
+    }
+}
+
+impl Sum for NanoDuration {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::from_nanos(0), |acc, x| acc + x)
     }
 }

@@ -33,7 +33,7 @@ use dungeon_vr_session_shared::physics::{
 use dungeon_vr_session_shared::render::RenderComponent;
 use dungeon_vr_session_shared::resources::{AllActionsResource, EntitiesByNetIdResource};
 use dungeon_vr_session_shared::snapshot::write_snapshot;
-use dungeon_vr_session_shared::time::{LocalEpoch, ServerEpoch};
+use dungeon_vr_session_shared::time::{NanoDuration, ServerTime, ServerTokioEpoch, TokioEpoch};
 use dungeon_vr_session_shared::{PlayerId, TickId, TICK_INTERVAL};
 use dungeon_vr_socket::AddrBound;
 use dungeon_vr_stream_codec::StreamCodec;
@@ -42,7 +42,7 @@ use futures::{FutureExt, StreamExt};
 use rapier3d::prelude::*;
 use tokio::select;
 use tokio::sync::mpsc;
-use tokio::time::{interval, Interval};
+use tokio::time::{interval, sleep_until, Interval};
 
 const SEND_ASSIGNMENT_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -118,13 +118,14 @@ struct InnerServer<Addr> {
     connection_events: mpsc::Receiver<ConnectionEvent<Addr>>,
     clients: HashMap<Addr, ClientState>,
     players: Vec<Option<PlayerState<Addr>>>,
-    epoch: ServerEpoch,
+    epoch: ServerTokioEpoch,
     world: World,
     tick_schedule: Schedule,
     net_ids: NetIdAllocator,
-    tick_interval: Interval,
     /// The ID of the most recently completed tick.
     last_completed_tick_id: TickId,
+    /// When the next tick is scheduled.
+    next_tick_time: ServerTime,
 }
 
 struct ClientState {
@@ -134,7 +135,20 @@ struct ClientState {
 struct PlayerState<Addr> {
     addr: Addr,
     send_assignment: Option<Pin<Box<Interval>>>,
-    actions_by_tick_id: BTreeMap<TickId, Vec<Action>>,
+    committed_actions_by_tick_id: BTreeMap<TickId, CommittedActions>,
+    slack_estimate_nanoseconds: f64,
+}
+
+impl<Addr> PlayerState<Addr> {
+    fn record_slack_observation(&mut self, slack: NanoDuration) {
+        self.slack_estimate_nanoseconds =
+            0.99 * self.slack_estimate_nanoseconds + 0.01 * slack.as_nanos() as f64;
+    }
+}
+
+struct CommittedActions {
+    slack: NanoDuration,
+    actions: Vec<Action>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, StageLabel)]
@@ -275,7 +289,7 @@ impl<Addr: AddrBound> InnerServer<Addr> {
         world.insert_resource(entities_by_net_id);
         world.insert_resource(LocalAuthorityResource(Some(Authority::Server)));
 
-        let epoch = LocalEpoch::new();
+        let epoch = TokioEpoch::new();
         Self {
             cancel_token,
             connection_requests,
@@ -319,8 +333,8 @@ impl<Addr: AddrBound> InnerServer<Addr> {
                     ),
             ),
             net_ids,
-            tick_interval: interval(TICK_INTERVAL),
             last_completed_tick_id: TickId(0),
+            next_tick_time: epoch.now() + TICK_INTERVAL,
         }
     }
 
@@ -331,6 +345,7 @@ impl<Addr: AddrBound> InnerServer<Addr> {
                     Event::PlayerEvent(player.wait_for_event(player_id).await)
                 }),
             );
+            let tick = sleep_until(self.epoch.instant_at(self.next_tick_time));
 
             let event = select! {
                 biased;
@@ -339,7 +354,7 @@ impl<Addr: AddrBound> InnerServer<Addr> {
 
                 Some(event) = dynamic_events.next() => event,
 
-                _ = self.tick_interval.tick() => Event::Tick,
+                _ = tick => Event::Tick,
             };
             drop(dynamic_events);
 
@@ -409,7 +424,8 @@ impl<Addr: AddrBound> InnerServer<Addr> {
                             // Prepare to tell this player their player ID assignment repeatedly
                             // until we process a session packet indicating they got the message.
                             send_assignment: Some(Box::pin(interval(SEND_ASSIGNMENT_INTERVAL))),
-                            actions_by_tick_id: BTreeMap::new(),
+                            committed_actions_by_tick_id: BTreeMap::new(),
+                            slack_estimate_nanoseconds: 0.0,
                         });
                         *client = ClientState {
                             player_id: Some(player_id),
@@ -535,6 +551,8 @@ impl<Addr: AddrBound> InnerServer<Addr> {
             Packet::Pong(PongPacket {
                 client_time: packet.client_time,
                 server_time: self.epoch.now(),
+                server_last_completed_tick: self.last_completed_tick_id,
+                server_tick_interval: TICK_INTERVAL,
             }),
         )
         .await;
@@ -568,12 +586,28 @@ impl<Addr: AddrBound> InnerServer<Addr> {
         };
         let player = self.players[player_id.index()].as_mut().unwrap();
         for (tick_id, actions) in packet.actions_by_tick_id {
-            match player.actions_by_tick_id.entry(tick_id) {
+            match player.committed_actions_by_tick_id.entry(tick_id) {
                 btree_map::Entry::Occupied(_) => {
-                    // Actions have already been committed for this tick.
+                    // Actions have already been committed for this tick. This is expected to happen
+                    // frequently due to eager over-sending.
                 }
                 btree_map::Entry::Vacant(entry) => {
-                    entry.insert(actions);
+                    // Compute when this tick would have happened or will happen.
+                    let tick_delta_from_next =
+                        tick_id.0 as i64 - (self.last_completed_tick_id.0 as i64 + 1);
+                    let time_delta_from_next = TICK_INTERVAL * tick_delta_from_next;
+                    let tick_time = self.next_tick_time + time_delta_from_next;
+                    // Slack is positive when actions are committed early and negative when they are
+                    // committed late.
+                    let slack = tick_time - self.epoch.now();
+
+                    if tick_id > self.last_completed_tick_id {
+                        // Commits that arrive ahead of time are stored for the upcoming tick.
+                        entry.insert(CommittedActions { slack, actions });
+                    } else {
+                        // Commits that arrive late only affect the slack estimate.
+                        player.record_slack_observation(slack);
+                    }
                 }
             }
         }
@@ -615,23 +649,33 @@ impl<Addr: AddrBound> InnerServer<Addr> {
 
     async fn handle_tick(&mut self) {
         let tick_id = self.last_completed_tick_id.next();
+        let tick_time = self.next_tick_time;
 
         // Gather the current committed actions for this tick from each player.
         self.world.insert_resource(AllActionsResource({
             let mut all_actions = HashMap::new();
-            for (player_id, player) in iter_players(&self.players) {
-                if let Some(actions) = player.actions_by_tick_id.get(&tick_id) {
-                    all_actions.insert(player_id, actions.clone());
+            for (player_id, player) in iter_players_mut(&mut self.players) {
+                if let Some(committed_actions) = player.committed_actions_by_tick_id.get(&tick_id) {
+                    all_actions.insert(player_id, committed_actions.actions.clone());
+                    player.record_slack_observation(committed_actions.slack);
+                } else {
+                    log::warn!("No actions from {player_id} by {tick_id:?} deadline");
+                    // TODO: Use this as the timeout criterion.
                 }
             }
             all_actions
         }));
         self.tick_schedule.run(&mut self.world);
 
+        self.last_completed_tick_id = tick_id;
+        self.next_tick_time += TICK_INTERVAL;
+
         // Discard obsolete committed actions.
+        // TODO: Keep some window of history to use for tuning client send rates.
+        // TODO: Record a -WINDOW_SIZE slack observation when a vacant slot goes out of the window.
         for player in self.players.iter_mut().flatten() {
             player
-                .actions_by_tick_id
+                .committed_actions_by_tick_id
                 .retain(|&action_tick_id, _| action_tick_id > tick_id);
         }
 
@@ -642,22 +686,19 @@ impl<Addr: AddrBound> InnerServer<Addr> {
             w
         };
         for player in self.players.iter().flatten() {
-            const GOAL_BUFFER_SIZE: i32 = 3;
+            const GOAL_SLACK_NS: f64 = 100_000_000.0;
 
-            let highest_buffered_tick_id = player
-                .actions_by_tick_id
-                .keys()
-                .next_back()
-                .copied()
-                .unwrap_or(tick_id);
-            let buffer_size = highest_buffered_tick_id.0.saturating_sub(tick_id.0) as i32;
-            let error = buffer_size - GOAL_BUFFER_SIZE;
+            let error_seconds = (player.slack_estimate_nanoseconds - GOAL_SLACK_NS) * 1e-9;
+            let error_ticks = error_seconds / TICK_INTERVAL.as_secs_f64();
 
             // Compute the tick rate that would resolve the error over the next 10 seconds.
-            let tick_rate = 1.0 / TICK_INTERVAL.as_secs_f64() - error as f64 / 10.0;
-            let tick_interval = Duration::from_secs_f64(1.0 / tick_rate);
+            let tick_rate = 1.0 / TICK_INTERVAL.as_secs_f64() - error_ticks as f64 / 10.0;
+            let tick_interval = NanoDuration::from_secs_f64(1.0 / tick_rate)
+                .clamp(TICK_INTERVAL * 9 / 10, TICK_INTERVAL * 11 / 10);
             log::debug!(
-                "Input buffer size {buffer_size}; assigning client tick interval {tick_interval:?}",
+                "Slack estimate {:.3} ms; assigning client tick interval {:.3} ns",
+                player.slack_estimate_nanoseconds * 1e-6,
+                tick_interval.as_nanos(),
             );
 
             send_game_data(
@@ -671,8 +712,6 @@ impl<Addr: AddrBound> InnerServer<Addr> {
             )
             .await;
         }
-
-        self.last_completed_tick_id = tick_id;
     }
 }
 

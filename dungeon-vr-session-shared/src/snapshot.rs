@@ -89,9 +89,6 @@ pub fn write_snapshot(w: &mut Vec<u8>, world: &mut World) -> Result<(), Infallib
             5u8.write_to(w)?;
             grabbable.grabbed.write_to(w)?;
         }
-        if let Some(_) = entity.get::<FlyAroundComponent>() {
-            0xffu8.write_to(w)?;
-        }
         0u8.write_to(w)?;
     }
     Ok(())
@@ -133,7 +130,6 @@ pub fn apply_snapshot(r: &mut &[u8], world: &mut World) -> Result<(), ReadSnapsh
             let mut transform = None;
             let mut render = None;
             let mut physics = None;
-            let mut flies_around = None;
             let mut hand = None;
             let mut grabbable = None;
             loop {
@@ -177,9 +173,6 @@ pub fn apply_snapshot(r: &mut &[u8], world: &mut World) -> Result<(), ReadSnapsh
                         let grabbed = bool::read_from(r)?;
                         grabbable = Some(GrabbableComponent { grabbed });
                     }
-                    0xff => {
-                        flies_around = Some(FlyAroundComponent);
-                    }
                     token => return Err(ReadSnapshotError::InvalidGameStateToken(token)),
                 }
             }
@@ -191,7 +184,6 @@ pub fn apply_snapshot(r: &mut &[u8], world: &mut World) -> Result<(), ReadSnapsh
             update_component(entity.borrow_mut(), physics, ctx.borrow_mut());
             update_component(entity.borrow_mut(), hand, ctx.borrow_mut());
             update_component(entity.borrow_mut(), grabbable, ctx.borrow_mut());
-            update_component(entity.borrow_mut(), flies_around, ctx.borrow_mut());
         }
         Ok(())
     })
